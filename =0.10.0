@@ -1,0 +1,38 @@
+Collecting pdfplumber
+  Downloading pdfplumber-0.11.9-py3-none-any.whl.metadata (43 kB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 43.6/43.6 kB 265.9 kB/s eta 0:00:00
+
+Collecting pdfminer.six==20251230 (from pdfplumber)
+  Downloading pdfminer_six-20251230-py3-none-any.whl.metadata (4.3 kB)
+Requirement already satisfied: Pillow>=9.1 in ./.venv/lib/python3.12/site-packages (from pdfplumber) (12.1.0)
+Collecting pypdfium2>=4.18.0 (from pdfplumber)
+  Downloading pypdfium2-5.3.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (67 kB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 67.8/67.8 kB 491.4 kB/s eta 0:00:00
+
+Requirement already satisfied: charset-normalizer>=2.0.0 in ./.venv/lib/python3.12/site-packages (from pdfminer.six==20251230->pdfplumber) (3.4.4)
+Collecting cryptography>=36.0.0 (from pdfminer.six==20251230->pdfplumber)
+  Downloading cryptography-46.0.3-cp311-abi3-manylinux_2_34_x86_64.whl.metadata (5.7 kB)
+Collecting cffi>=2.0.0 (from cryptography>=36.0.0->pdfminer.six==20251230->pdfplumber)
+  Downloading cffi-2.0.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (2.6 kB)
+Collecting pycparser (from cffi>=2.0.0->cryptography>=36.0.0->pdfminer.six==20251230->pdfplumber)
+  Downloading pycparser-2.23-py3-none-any.whl.metadata (993 bytes)
+Downloading pdfplumber-0.11.9-py3-none-any.whl (60 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 60.0/60.0 kB 953.9 kB/s eta 0:00:00
+
+Downloading pdfminer_six-20251230-py3-none-any.whl (6.6 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 6.6/6.6 MB 1.9 MB/s eta 0:00:00
+
+Downloading pypdfium2-5.3.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (3.0 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 3.0/3.0 MB 4.0 MB/s eta 0:00:00
+
+Downloading cryptography-46.0.3-cp311-abi3-manylinux_2_34_x86_64.whl (4.5 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 4.5/4.5 MB 6.0 MB/s eta 0:00:00
+
+Downloading cffi-2.0.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (219 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 219.6/219.6 kB 2.2 MB/s eta 0:00:00
+
+Downloading pycparser-2.23-py3-none-any.whl (118 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 118.1/118.1 kB 5.3 MB/s eta 0:00:00
+
+Installing collected packages: pypdfium2, pycparser, cffi, cryptography, pdfminer.six, pdfplumber
+Successfully installed cffi-2.0.0 cryptography-46.0.3 pdfminer.six-20251230 pdfplumber-0.11.9 pycparser-2.23 pypdfium2-5.3.0

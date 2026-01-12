@@ -1,0 +1,32 @@
+{
+  "size_categories": {
+    "小型": {
+      "max_dimension": 25,
+      "sum_dimensions": 40,
+      "fee": 500
+    },
+    "標準1": {
+      "max_dimension": 30,
+      "sum_dimensions": 50,
+      "fee": 600
+    },
+    "標準2": {
+      "max_dimension": 40,
+      "sum_dimensions": 60,
+      "fee": 700
+    },
+    "標準2d": {
+      "max_dimension": 50,
+      "sum_dimensions": 70,
+      "fee": 800
+    },
+    "大型": {
+      "max_dimension": 999,
+      "sum_dimensions": 999,
+      "fee": 1000
+    }
+  },
+  "international_shipping_rate": 0.01,
+  "note": "配送代行手数料.pngの表に基づいて設定してください。実際の値に合わせて調整が必要です。"
+}
+
