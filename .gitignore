@@ -1,0 +1,112 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
+temp/
+tmp/
+
+# User uploaded files (Excel, PDF, etc.)
+# Keep example files but ignore actual data files
+*.xls
+*.xlsx
+*.pdf
+!*.example
+!manual_input.txt.example
+!option_cost_distribution.txt.example
+
+# Output files
+output/
+results/
+*.xlsx
+!requirements.txt
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Configuration files with sensitive data
+# Keep example configs but ignore actual configs with real data
+shipping_fee_config.json
+!shipping_fee_config.json.example
+
+# Session state
+.streamlit/
+
+# Debug files
+*.debug
+debug.log
+/tmp/fba_instruction_debug.log
+
