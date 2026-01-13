@@ -995,34 +995,157 @@ def extract_customer_number(value: str) -> str:
     return str(value).strip().rstrip('.').strip()
 
 
+def convert_to_native_types(obj):
+    """numpy型やpandas型をPythonネイティブ型に変換（JSONシリアライズ可能にする）"""
+    import numpy as np
+    if isinstance(obj, (np.integer, np.int64, np.int32)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64, np.float32)):
+        return float(obj)
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: convert_to_native_types(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_to_native_types(item) for item in obj]
+    elif pd.isna(obj):
+        return None
+    else:
+        return obj
+
+
 def extract_order_id_from_text(cell: str) -> str:
+    """使用状況の詳細などのテキストから注文番号（オーダーID）を抽出"""
+    if pd.isna(cell) or cell == '':
+        return ''
+    
     text = str(cell)
+    
+    # より柔軟なパターンマッチング（全角半角、空白、改行に対応）
+    # 優先順位：より具体的なパターンから試す
+    # 注意：空白はオプション（\s*）として扱う
     patterns = [
-        r'オーダー\s*ID[:：]\s*([0-9]+)',
-        r'Order\s*ID[:：]\s*([0-9]+)',
-        r'オーダー番号[:：]\s*([0-9]+)',
-        r'Order\s*No[:：]\s*([0-9]+)'
+        r'オーダー\s*ID\s*[:：]\s*([0-9]{6,})',  # オーダーID：5184172（全角コロン、空白あり）
+        r'オーダー\s*ID[:：]\s*([0-9]{6,})',     # オーダーID:5191927（半角コロン、空白なし）
+        r'オーダー\s*ID\s*[:：]([0-9]{6,})',     # オーダーID：5184172（コロン直後）
+        r'オーダー\s*ID[:：]([0-9]{6,})',        # オーダーID:5191927（空白・コロン直後）
+        r'Order\s*ID\s*[:：]\s*([0-9]{6,})',     # Order ID：5184172
+        r'Order\s*ID[:：]\s*([0-9]{6,})',        # Order ID:5184172（空白なし）
+        r'Order\s*ID\s*[:：]([0-9]{6,})',        # Order ID：5184172（コロン直後）
+        r'Order\s*ID[:：]([0-9]{6,})',           # Order ID:5184172（空白・コロン直後）
+        r'オーダー番号\s*[:：]\s*([0-9]{6,})',   # オーダー番号：5184172
+        r'Order\s*No\s*[:：]\s*([0-9]{6,})',     # Order No：5184172
+        r'注文番号\s*[:：]\s*([0-9]{6,})',       # 注文番号：5184172
+        r'注文\s*ID\s*[:：]\s*([0-9]{6,})',      # 注文ID：5184172
+        r'オーダー\s*ID\s*[=＝]\s*([0-9]{6,})',  # オーダーID=5184172
+        r'Order\s*ID\s*[=＝]\s*([0-9]{6,})',     # Order ID=5184172
+        r'オーダー\s*ID\s*([0-9]{7,})',          # オーダーID5184172（区切り文字なし、7桁以上）
+        r'Order\s*ID\s*([0-9]{7,})',             # Order ID5184172（区切り文字なし、7桁以上）
     ]
+    
     for pat in patterns:
-        match = re.search(pat, text)
+        match = re.search(pat, text, re.IGNORECASE)
         if match:
-            return match.group(1).strip()
+            order_id = match.group(1).strip()
+            # 6桁以上の数字のみを有効とする
+            if len(order_id) >= 6:
+                return order_id
+    
+    # フォールバック：7桁以上の数字を探す（ただし、商品名や価格に含まれる数字を除外するため慎重に）
+    # オーダーIDの近くにある数字のみを対象とする
+    fallback_pattern = r'(?:オーダー|Order|注文).*?([0-9]{7,})'
+    match = re.search(fallback_pattern, text, re.IGNORECASE)
+    if match:
+        order_id = match.group(1).strip()
+        if len(order_id) >= 7:
+            return order_id
+    
     return ''
 
 
 def _find_price_columns(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
-    cny_candidates = ['金額（cny）', '金額(cny)', '金額', 'amount', 'cny', 'currency amount']
-    jpy_candidates = ['参考金額', '参考金額（jpy）', 'jpy', 'product_amount']
+    """
+    金額列（CNY）と参考金額列（JPY）を検出
+    """
     cny_col = None
     jpy_col = None
+    
     for col in df.columns:
-        lower = str(col).lower()
-        if not cny_col and any(keyword in lower for keyword in cny_candidates):
-            cny_col = col
-        if not jpy_col and any(keyword in lower for keyword in jpy_candidates):
-            jpy_col = col
+        col_str = str(col).strip()
+        col_lower = col_str.lower()
+        # 空白を除去したバージョンも作成（検出の柔軟性を高める）
+        col_no_space = re.sub(r'\s+', '', col_str)
+        col_no_space_lower = col_no_space.lower()
+        
+        # CNY列の検出（優先順位順）
+        if not cny_col:
+            # 1. 「金額 (CNY)」や「金額（CNY）」のような形式（括弧の前に空白がある形式を優先）
+            # パターン: 金額 + 空白 + ( または （ + 空白 + CNY + 空白 + ) または ）
+            if re.search(r'金額\s+[（(]\s*cny\s*[）)]', col_lower, re.IGNORECASE):
+                cny_col = col
+            # 1-2. 「金額(CNY)」や「金額（CNY）」のような形式（括弧の種類を問わない、大文字小文字を無視）
+            # パターン: 金額 + 任意の空白 + ( または （ + 任意の空白 + CNY + 任意の空白 + ) または ）
+            elif re.search(r'金額\s*[（(]\s*cny\s*[）)]', col_lower, re.IGNORECASE):
+                cny_col = col
+            # 1-3. 空白なしの形式「金額(CNY)」
+            elif re.search(r'金額[（(]cny[）)]', col_no_space_lower, re.IGNORECASE):
+                cny_col = col
+            # 2. 「金額(CNY)」のような形式（括弧なしの可能性も考慮）
+            elif re.search(r'金額\s*\(?\s*cny\s*\)?', col_lower, re.IGNORECASE):
+                cny_col = col
+            # 3. 「金額」と「CNY」が含まれる（順序は問わない）
+            elif '金額' in col_str and 'cny' in col_lower:
+                # ただし、JPY列でない場合
+                if 'jpy' not in col_lower and '参考' not in col_str:
+                    cny_col = col
+            # 4. 「金額」のみ（ただし、JPY列でない場合、かつ「参考」が含まれない場合）
+            elif '金額' in col_str and 'jpy' not in col_lower and '参考' not in col_str and '参考金額' not in col_str:
+                cny_col = col
+            # 5. 「amount」や「cny」を含む列（JPY列でない場合）
+            elif ('amount' in col_lower or 'cny' in col_lower) and 'jpy' not in col_lower:
+                cny_col = col
+        
+        # JPY列の検出（優先順位順）
+        if not jpy_col:
+            # 1. 「参考金額 (JPY)」のような形式（括弧の前に空白がある形式を優先）
+            if re.search(r'参考金額\s+[（(]\s*jpy\s*[）)]', col_lower, re.IGNORECASE):
+                jpy_col = col
+            # 1-2. 「参考金額(JPY)」や「参考金額（JPY）」のような形式
+            elif re.search(r'参考金額\s*[（(]\s*jpy\s*[）)]', col_lower, re.IGNORECASE):
+                jpy_col = col
+            # 1-3. 「参考金額 (JPY)(CNY)」のような形式（最後の(CNY)は無視）
+            elif re.search(r'参考金額\s+[（(]\s*jpy\s*[）)]\s*[（(]\s*cny\s*[）)]', col_lower, re.IGNORECASE):
+                jpy_col = col
+            # 1-4. 「参考金額(JPY)(CNY)」のような形式（最後の(CNY)は無視）
+            elif re.search(r'参考金額\s*[（(]\s*jpy\s*[）)]\s*[（(]\s*cny\s*[）)]', col_lower, re.IGNORECASE):
+                jpy_col = col
+            # 1-5. 空白なしの形式「参考金額(JPY)(CNY)」
+            elif re.search(r'参考金額[（(]jpy[）)][（(]cny[）)]', col_no_space_lower, re.IGNORECASE):
+                jpy_col = col
+            # 1-6. 空白なしの形式「参考金額(JPY)」
+            elif re.search(r'参考金額[（(]jpy[）)]', col_no_space_lower, re.IGNORECASE):
+                jpy_col = col
+            # 2. 「参考金額」を含む列（JPYが含まれていなくても、参考金額があればJPY列とみなす）
+            elif '参考金額' in col_str:
+                jpy_col = col
+            # 3. 「参考」と「金額」が含まれる列
+            elif '参考' in col_str and '金額' in col_str:
+                jpy_col = col
+            # 4. 「jpy」を含む列（CNY列でない場合、かつ「参考金額」が含まれる場合を優先）
+            elif 'jpy' in col_lower:
+                # 「参考金額」が含まれる場合は優先
+                if '参考' in col_str or '参考金額' in col_str:
+                    jpy_col = col
+                # それ以外の場合、CNY列でない場合のみ
+                elif 'cny' not in col_lower:
+                    jpy_col = col
+        
+        # 両方見つかったら終了
         if cny_col and jpy_col:
             break
+    
     return cny_col, jpy_col
 
 
@@ -1047,21 +1170,282 @@ def get_record_list_preview(order_numbers: List[str], file_path: str, asin_order
         df.columns = df.columns.str.strip()
         df = promote_header_row(df, ['注文番号', 'オーダーID', 'Order ID', '使用状況', '金額', 'オーダー番号'])
         
-        # 注文番号列を検出
-        order_col = find_matching_column(df, ['注文番号', 'オーダーID', 'order_no', 'order number', 'オーダー番号'])
-        detail_col = find_matching_column(df, ['使用状況', '使用状況の詳細', 'detail', '操作の種類'])
+        # 注文番号列を検出（列名が短く、キーワードを含む場合のみ有効）
+        order_col = None
+        for candidate in ['注文番号', 'オーダーID', 'order_no', 'order number', 'オーダー番号']:
+            found = find_matching_column(df, [candidate])
+            if found:
+                # 列名が短い（50文字以下）場合のみ有効とする
+                if len(str(found)) <= 50:
+                    order_col = found
+                    break
         
-        # 注文番号列がない場合、使用状況列からテキスト抽出
-        if not order_col and detail_col:
+        # 使用状況列を検出（より多くの候補を試す）
+        detail_col = find_matching_column(df, [
+            '使用状況', '使用状況の詳細', 'detail', '操作の種類',
+            '使用状況の詳細', '使用状況詳細', '操作種類', '操作の種類',
+            '状況', '詳細', '操作'
+        ])
+        
+        # detail_colが見つからない場合、列名に「使用状況」や「詳細」が含まれる列を探す
+        if not detail_col:
+            for col in df.columns:
+                col_str = str(col).lower()
+                # 「使用状況」や「詳細」が含まれ、かつ列名が長い（実際のデータが列名になっている可能性）場合
+                if ('使用状況' in col_str or '詳細' in col_str or 'detail' in col_str) and len(str(col)) > 50:
+                    # この列の内容を確認（「オーダーID」が含まれているか）
+                    sample_val = str(df[col].dropna().iloc[0] if not df[col].dropna().empty else '')
+                    if 'オーダー' in sample_val or 'order' in sample_val.lower() or 'id' in sample_val.lower():
+                        detail_col = col
+                        debug_info['detail_col_detected_by_content'] = True
+                        break
+        
+        # 列名の候補を確認（デバッグ用）
+        all_columns = df.columns.tolist()
+        debug_info = {}
+        debug_info['all_columns'] = all_columns[:20]  # 最初の20列
+        debug_info['detected_order_col'] = order_col if order_col else '見つかりませんでした'
+        debug_info['detected_detail_col'] = detail_col if detail_col else '見つかりませんでした'
+        debug_info['total_rows'] = int(len(df))  # numpy型をPythonネイティブ型に変換
+        
+        # order_colが見つかった場合でも、実際に注文番号が含まれているか確認
+        order_col_valid = False
+        if order_col:
+            # order_colの値を確認（数値のみ、または短い文字列の場合は無効とみなす）
+            sample_values = df[order_col].dropna().head(10).tolist()
+            debug_info['order_col_samples'] = sample_values
+            
+            # 列名が長すぎる場合は無効とする（実際のデータが列名として誤検出されている可能性）
+            if len(str(order_col)) > 100:
+                debug_info['order_col_rejected'] = f"列名が長すぎます（{len(str(order_col))}文字）"
+                # この列は実際には「使用状況の詳細」列の可能性が高い
+                if not detail_col:
+                    detail_col = order_col
+                    debug_info['detail_col_fallback'] = f"長い列名をdetail_colとして使用: {str(order_col)[:50]}..."
+                order_col = None
+                order_col_valid = False
+            else:
+                # 6桁以上の数字が含まれているか確認
+                for val in sample_values:
+                    val_str = str(val).strip()
+                    # 6桁以上の数字のみを含む場合
+                    if re.match(r'^[0-9]{6,}$', val_str):
+                        order_col_valid = True
+                        break
+                    # 長いテキストに7桁以上の数字が含まれている場合は、注文番号列ではない可能性が高い
+                    elif len(val_str) > 50 and re.search(r'[0-9]{7,}', val_str):
+                        # 長いテキストの場合は、注文番号列として扱わない
+                        # ただし、この列をdetail_colとして使用する可能性がある
+                        if not detail_col and ('オーダー' in val_str or 'order' in val_str.lower() or 'id' in val_str.lower()):
+                            detail_col = order_col
+                            debug_info['detail_col_fallback'] = f"長いテキストを含む列をdetail_colとして使用"
+                        order_col_valid = False
+                        break
+        
+        # detail_colの内容を確認（実際に「オーダーID」が含まれているか）
+        detail_col_valid = False
+        if detail_col:
+            sample_detail = df[detail_col].dropna().head(3).tolist()
+            debug_info['detail_col_samples'] = sample_detail
+            for val in sample_detail:
+                val_str = str(val)
+                if 'オーダー' in val_str or 'order' in val_str.lower() or ('id' in val_str.lower() and ':' in val_str):
+                    detail_col_valid = True
+                    break
+        
+        # detail_colが見つからない場合、すべての列を確認して「オーダーID」が含まれる列を探す
+        if not detail_col:
+            debug_info['searching_all_columns'] = True
+            for col in df.columns:
+                # 列名が長い（実際のデータが列名になっている可能性）場合
+                if len(str(col)) > 50:
+                    # この列の内容を確認（「オーダーID」が含まれているか）
+                    sample_val = str(df[col].dropna().iloc[0] if not df[col].dropna().empty else '')
+                    if 'オーダー' in sample_val and ('id' in sample_val.lower() or 'ID' in sample_val):
+                        detail_col = col
+                        detail_col_valid = True
+                        debug_info['detail_col_found_by_content_search'] = True
+                        debug_info['detected_detail_col'] = f"{str(col)[:50]}..."  # 最初の50文字
+                        break
+        
+        # 注文番号列がない、または有効な注文番号が含まれていない場合、使用状況列からテキスト抽出
+        # detail_colが存在する場合は、有効性に関わらず抽出を試みる
+        if (not order_col or not order_col_valid) and detail_col:
+            if not detail_col_valid:
+                debug_info['detail_col_warning'] = f"'{detail_col}'列に「オーダーID」が含まれていない可能性がありますが、抽出を試みます"
+            debug_info['extraction_method'] = f"'{detail_col}'列から抽出を試みます"
+            if not order_col:
+                debug_info['extraction_reason'] = "注文番号列が見つかりませんでした"
+            else:
+                debug_info['extraction_reason'] = f"検出された'{order_col}'列に有効な注文番号が含まれていませんでした"
+            
+            # 元のテキストサンプルを保存（抽出前）
+            original_samples = df[detail_col].dropna().head(5).tolist()
+            debug_info['original_text_samples'] = original_samples
+            
+            # 抽出を実行
             df['抽出用注文番号'] = df[detail_col].apply(extract_order_id_from_text)
-            order_col = '抽出用注文番号'
+            
+            # 抽出結果を確認
+            extracted_count = df['抽出用注文番号'].notna().sum()
+            non_empty_count = (df['抽出用注文番号'] != '').sum()
+            debug_info['extracted_count'] = int(non_empty_count)  # numpy型をPythonネイティブ型に変換
+            
+            # 抽出テスト：最初の5行で抽出を試みて結果を確認
+            test_samples = []
+            for idx, row in df.head(5).iterrows():
+                original_text = str(row[detail_col]) if pd.notna(row[detail_col]) else ''
+                extracted = row['抽出用注文番号'] if pd.notna(row['抽出用注文番号']) else ''
+                if original_text:
+                    test_samples.append({
+                        'original': original_text[:100],  # 最初の100文字
+                        'extracted': extracted
+                    })
+            debug_info['extraction_test_samples'] = test_samples
+            
+            if non_empty_count > 0:
+                # 抽出サンプルを表示（デバッグ用）
+                sample_extracted = df[df['抽出用注文番号'] != '']['抽出用注文番号'].head(10).tolist()
+                debug_info['extracted_samples'] = sample_extracted
+                order_col = '抽出用注文番号'
+                debug_info['extraction_success'] = True
+            else:
+                # 抽出に失敗した場合
+                debug_info['extraction_failed'] = True
+                debug_info['source_samples'] = original_samples
+                # それでも抽出を試みる（空文字列でも列は作成される）
+                order_col = '抽出用注文番号'
+        elif order_col and order_col_valid:
+            # 既存の注文番号列を使用
+            debug_info['extraction_method'] = f"既存の'{order_col}'列を使用"
+            debug_info['extraction_success'] = True
         
         if not order_col:
-            # 注文番号列が見つからない場合、order_numbers を使って手動で作成
-            return pd.DataFrame()
+            # 注文番号列が見つからない場合
+            debug_info['error'] = "注文番号列が見つかりませんでした"
+            empty_df = pd.DataFrame()
+            # numpy型をPythonネイティブ型に変換
+            debug_info_converted = convert_to_native_types(debug_info)
+            empty_df.attrs = {'debug_info': debug_info_converted, 'missing_orders': [str(o) for o in order_numbers]}
+            return empty_df
         
-        # 金額列を検出
-        cny_col, jpy_col = _find_price_columns(df)
+        # 金額列を検出（オーダーIDを含む列の位置関係に基づく）
+        all_cols = df.columns.tolist()
+        debug_info['all_columns'] = all_cols  # すべての列名を保存
+        
+        cny_col = None
+        jpy_col = None
+        
+        # オーダーIDを含む列を特定（detail_colを優先、なければorder_col）
+        order_id_source_col = None
+        if detail_col and detail_col in all_cols:
+            order_id_source_col = detail_col
+            debug_info['order_id_source_col'] = f"使用状況の詳細列: {detail_col}"
+        elif order_col and order_col in all_cols and order_col != '抽出用注文番号':
+            order_id_source_col = order_col
+            debug_info['order_id_source_col'] = f"注文番号列: {order_col}"
+        
+        # オーダーIDを含む列が見つかった場合、位置関係に基づいて金額列を特定
+        if order_id_source_col:
+            try:
+                source_col_idx = all_cols.index(order_id_source_col)
+                debug_info['order_id_source_col_index'] = source_col_idx
+                
+                # オーダーIDを含む列の次の列（+1）が金額(CNY)
+                if source_col_idx + 1 < len(all_cols):
+                    cny_col = all_cols[source_col_idx + 1]
+                    debug_info['cny_col_detection_method'] = f"位置関係（オーダーID列の次の列、インデックス{source_col_idx + 1}）"
+                    debug_info['cny_col_index'] = source_col_idx + 1
+                else:
+                    debug_info['cny_col_detection_error'] = f"オーダーID列の次の列が存在しません（インデックス{source_col_idx + 1}）"
+                
+                # オーダーIDを含む列の次の次の列（+2）が参考金額(JPY)
+                if source_col_idx + 2 < len(all_cols):
+                    jpy_col = all_cols[source_col_idx + 2]
+                    debug_info['jpy_col_detection_method'] = f"位置関係（オーダーID列の+2列目、インデックス{source_col_idx + 2}）"
+                    debug_info['jpy_col_index'] = source_col_idx + 2
+                else:
+                    debug_info['jpy_col_detection_error'] = f"オーダーID列の+2列目が存在しません（インデックス{source_col_idx + 2}）"
+                
+            except (ValueError, IndexError) as e:
+                debug_info['position_based_detection_error'] = str(e)
+        
+        # 位置関係で見つからない場合、列名ベースの検出を試みる
+        if not cny_col or not jpy_col:
+            cny_col_fallback, jpy_col_fallback = _find_price_columns(df)
+            if not cny_col:
+                cny_col = cny_col_fallback
+                if cny_col:
+                    debug_info['cny_col_detection_method'] = "列名ベース（フォールバック）"
+            if not jpy_col:
+                jpy_col = jpy_col_fallback
+                if jpy_col:
+                    debug_info['jpy_col_detection_method'] = "列名ベース（フォールバック）"
+        
+        debug_info['detected_cny_col'] = cny_col if cny_col else '見つかりませんでした'
+        debug_info['detected_jpy_col'] = jpy_col if jpy_col else '見つかりませんでした'
+        
+        # 金額関連の列を探す（デバッグ用）
+        amount_related_cols = [col for col in all_cols if any(keyword in str(col).lower() for keyword in ['金額', 'amount', 'cny', 'jpy', '元', '円'])]
+        debug_info['amount_related_columns'] = amount_related_cols
+        
+        # 各列名に対して検出パターンをテスト（デバッグ用）
+        cny_pattern_matches = []
+        jpy_pattern_matches = []
+        for col in all_cols:
+            col_str = str(col).strip()
+            col_lower = col_str.lower()
+            col_no_space = re.sub(r'\s+', '', col_str)
+            col_no_space_lower = col_no_space.lower()
+            
+            # CNY列のパターンテスト
+            if re.search(r'金額\s+[（(]\s*cny\s*[）)]', col_lower, re.IGNORECASE):
+                cny_pattern_matches.append(f"`{col}` → パターン1: 金額 (CNY) (空白あり) にマッチ")
+            elif re.search(r'金額\s*[（(]\s*cny\s*[）)]', col_lower, re.IGNORECASE):
+                cny_pattern_matches.append(f"`{col}` → パターン1-2: 金額(CNY) にマッチ")
+            elif re.search(r'金額[（(]cny[）)]', col_no_space_lower, re.IGNORECASE):
+                cny_pattern_matches.append(f"`{col}` → パターン1-3: 金額(CNY) (空白なし) にマッチ")
+            elif re.search(r'金額\s*\(?\s*cny\s*\)?', col_lower, re.IGNORECASE):
+                cny_pattern_matches.append(f"`{col}` → パターン2: 金額CNY にマッチ")
+            elif '金額' in col_str and 'cny' in col_lower:
+                cny_pattern_matches.append(f"`{col}` → パターン3: 金額+CNY にマッチ")
+            elif '金額' in col_str and 'jpy' not in col_lower and '参考' not in col_str:
+                cny_pattern_matches.append(f"`{col}` → パターン4: 金額のみ にマッチ")
+            
+            # JPY列のパターンテスト
+            if re.search(r'参考金額\s+[（(]\s*jpy\s*[）)]', col_lower, re.IGNORECASE):
+                jpy_pattern_matches.append(f"`{col}` → パターン1: 参考金額 (JPY) (空白あり) にマッチ")
+            elif re.search(r'参考金額\s+[（(]\s*jpy\s*[）)]\s*[（(]\s*cny\s*[）)]', col_lower, re.IGNORECASE):
+                jpy_pattern_matches.append(f"`{col}` → パターン1-3: 参考金額 (JPY)(CNY) (空白あり) にマッチ")
+            elif re.search(r'参考金額\s*[（(]\s*jpy\s*[）)]\s*[（(]\s*cny\s*[）)]', col_lower, re.IGNORECASE):
+                jpy_pattern_matches.append(f"`{col}` → パターン1-2: 参考金額(JPY)(CNY) にマッチ")
+            elif re.search(r'参考金額[（(]jpy[）)][（(]cny[）)]', col_no_space_lower, re.IGNORECASE):
+                jpy_pattern_matches.append(f"`{col}` → パターン1-4: 参考金額(JPY)(CNY) (空白なし) にマッチ")
+            elif re.search(r'参考金額\s*[（(]\s*jpy\s*[）)]', col_lower, re.IGNORECASE):
+                jpy_pattern_matches.append(f"`{col}` → パターン1-5: 参考金額(JPY) にマッチ")
+            elif re.search(r'参考金額[（(]jpy[）)]', col_no_space_lower, re.IGNORECASE):
+                jpy_pattern_matches.append(f"`{col}` → パターン1-6: 参考金額(JPY) (空白なし) にマッチ")
+            elif '参考金額' in col_str:
+                jpy_pattern_matches.append(f"`{col}` → パターン2: 参考金額 にマッチ")
+            elif '参考' in col_str and '金額' in col_str:
+                jpy_pattern_matches.append(f"`{col}` → パターン3: 参考+金額 にマッチ")
+            elif 'jpy' in col_lower:
+                jpy_pattern_matches.append(f"`{col}` → パターン4: JPY にマッチ")
+        
+        debug_info['cny_pattern_matches'] = cny_pattern_matches
+        debug_info['jpy_pattern_matches'] = jpy_pattern_matches
+        
+        # 金額列が見つからない場合の警告
+        if not cny_col:
+            debug_info['cny_col_warning'] = '金額（CNY）列が見つかりませんでした'
+            # 候補となる列名を探す
+            cny_candidates = [col for col in all_cols if any(keyword in str(col).lower() for keyword in ['金額', 'amount', 'cny'])]
+            debug_info['cny_candidate_columns'] = cny_candidates
+        if not jpy_col:
+            debug_info['jpy_col_warning'] = '参考金額（JPY）列が見つかりませんでした'
+            # 候補となる列名を探す
+            jpy_candidates = [col for col in all_cols if any(keyword in str(col).lower() for keyword in ['参考', 'jpy', '参考金額'])]
+            debug_info['jpy_candidate_columns'] = jpy_candidates
         
         # 注文番号でフィルタ（カンマ区切りの注文番号にも対応）
         expanded_orders = []
@@ -1071,25 +1455,81 @@ def get_record_list_preview(order_numbers: List[str], file_path: str, asin_order
             else:
                 expanded_orders.append(str(order))
         
-        # フィルタリング
+        # 検索用の注文番号リストを正規化（空白除去、文字列化）
+        expanded_orders_str = [str(o).strip() for o in expanded_orders if str(o).strip()]
+        
+        # record-list側の注文番号を正規化
         df_order_str = df[order_col].astype(str).str.strip()
-        expanded_orders_str = [str(o).strip() for o in expanded_orders]
+        # 空文字や'nan'を除外
+        df_order_str = df_order_str.replace(['', 'nan', 'None'], pd.NA)
+        
+        # デバッグ情報を更新
+        debug_info['search_target_count'] = int(len(expanded_orders_str))  # numpy型をPythonネイティブ型に変換
+        debug_info['record_list_rows'] = int(len(df))  # numpy型をPythonネイティブ型に変換
+        debug_info['record_list_non_empty'] = int(df_order_str.notna().sum())  # numpy型をPythonネイティブ型に変換
+        debug_info['order_column'] = order_col
+        
+        # record-list側の実際の注文番号リストを取得（デバッグ用）
+        # 空文字や'nan'を除外した有効な注文番号のみ
+        available_orders = set()
+        for val in df_order_str.dropna():
+            val_str = str(val).strip()
+            # 6桁以上の数字のみを含む場合（注文番号として有効）
+            if val_str and val_str != 'nan' and val_str != 'None':
+                # 数字のみか、または7桁以上の数字を含むか確認
+                if re.match(r'^[0-9]{6,}$', val_str) or re.search(r'[0-9]{7,}', val_str):
+                    # 7桁以上の数字を抽出
+                    numbers = re.findall(r'[0-9]{7,}', val_str)
+                    if numbers:
+                        available_orders.add(numbers[0])  # 最初の7桁以上の数字を使用
+                    elif len(val_str) >= 6 and val_str.isdigit():
+                        available_orders.add(val_str)
+        
+        debug_info['available_orders_sample'] = list(available_orders)[:20]  # 最初の20個
+        debug_info['available_orders_count'] = int(len(available_orders))  # numpy型をPythonネイティブ型に変換
+        debug_info['search_target_sample'] = expanded_orders_str[:20]  # 最初の20個
+        
+        # 抽出前の元のテキストサンプルも保存（抽出方法が「使用状況の詳細」の場合）
+        # 既に保存されていない場合のみ追加
+        if 'original_text_samples' not in debug_info and order_col == '抽出用注文番号' and detail_col:
+            original_text_samples = df[detail_col].dropna().head(5).tolist()
+            debug_info['original_text_samples'] = original_text_samples
+        
+        # 完全一致でフィルタリング
         mask = df_order_str.isin(expanded_orders_str)
         subset = df[mask].copy()
         
         # 見つかった注文番号を記録
         found_orders = set(subset[order_col].astype(str).str.strip().unique())
+        found_orders.discard('')  # 空文字を除外
+        found_orders.discard('nan')  # 'nan'を除外
+        
         missing_orders = [o for o in expanded_orders_str if o not in found_orders]
         
-        # 見つからなかった注文番号をDataFrameの属性として保存
+        # デバッグ情報を更新
+        debug_info['found_count'] = int(len(found_orders))  # numpy型をPythonネイティブ型に変換
+        debug_info['missing_count'] = int(len(missing_orders))  # numpy型をPythonネイティブ型に変換
+        if found_orders:
+            debug_info['found_samples'] = list(found_orders)[:10]
         if missing_orders:
-            subset.attrs = getattr(subset, 'attrs', {})
-            subset.attrs['missing_orders'] = missing_orders
+            debug_info['missing_samples'] = missing_orders[:10]
+        
+        # 見つからなかった注文番号をDataFrameの属性として保存
+        # numpy型をPythonネイティブ型に変換
+        debug_info_converted = convert_to_native_types(debug_info)
+        missing_orders_str = [str(o) for o in missing_orders]
+        
+        subset.attrs = getattr(subset, 'attrs', {})
+        subset.attrs['missing_orders'] = missing_orders_str
+        subset.attrs['debug_info'] = debug_info_converted
         
         if subset.empty:
             # 空の場合でも見つからなかった注文番号を保存
             empty_df = pd.DataFrame()
-            empty_df.attrs = {'missing_orders': missing_orders}
+            empty_df.attrs = {
+                'missing_orders': missing_orders_str,
+                'debug_info': debug_info_converted
+            }
             return empty_df
         
         # 必要な列だけを抽出
@@ -2106,6 +2546,7 @@ def main():
                 if file_type == 'record_list' and order_numbers:
                     record_df = get_record_list_preview(order_numbers, file_path, send_order_matches)
                     missing_orders = getattr(record_df, 'attrs', {}).get('missing_orders', [])
+                    debug_info = getattr(record_df, 'attrs', {}).get('debug_info', {})
                     
                     if not record_df.empty:
                         st.subheader("📄 record_listのプレビュー")
@@ -2117,13 +2558,153 @@ def main():
                             if len(missing_orders) > 10:
                                 missing_list += f" ... 他{len(missing_orders) - 10}個"
                             st.error(f"⚠️ 以下の注文番号が record-list に存在しません: **{missing_list}**")
+                            
+                            # デバッグ情報を表示
+                            if debug_info:
+                                with st.expander("🔍 デバッグ情報を表示", expanded=False):
+                                    st.write("**抽出方法:**", debug_info.get('extraction_method', 'N/A'))
+                                    st.write("**抽出された注文番号数:**", debug_info.get('extracted_count', 0), f"（全{debug_info.get('total_rows', 0)}行中）")
+                                    
+                                    if 'extracted_samples' in debug_info and debug_info['extracted_samples']:
+                                        st.write("**✅ 抽出された注文番号のサンプル:**", ', '.join(map(str, debug_info['extracted_samples'][:10])))
+                                    else:
+                                        st.warning("**⚠️ 注文番号の抽出に失敗しました**")
+                                    
+                                    if 'available_orders_sample' in debug_info and debug_info['available_orders_sample']:
+                                        st.write(f"**record-listに存在する注文番号:** {debug_info.get('available_orders_count', 0)}個")
+                                        st.write("**サンプル:**", ', '.join(map(str, debug_info['available_orders_sample'][:10])))
+                                    else:
+                                        st.warning("**⚠️ record-listから注文番号を抽出できませんでした**")
+                                    
+                                    if 'search_target_sample' in debug_info:
+                                        st.write("**検索対象の注文番号（send-order-listから）:**", ', '.join(map(str, debug_info['search_target_sample'][:10])))
+                                    
+                                    if 'extraction_test_samples' in debug_info:
+                                        st.write("**🔬 抽出テスト結果（最初の5行）:**")
+                                        for i, test in enumerate(debug_info['extraction_test_samples'][:3], 1):
+                                            st.write(f"**サンプル {i}:**")
+                                            st.code(f"元のテキスト: {test['original']}", language='text')
+                                            if test['extracted']:
+                                                st.success(f"✅ 抽出成功: {test['extracted']}")
+                                            else:
+                                                st.error(f"❌ 抽出失敗")
+                                    
+                                    if 'original_text_samples' in debug_info:
+                                        st.write("**📝 元のテキストサンプル（使用状況の詳細列）:**")
+                                        for i, sample in enumerate(debug_info['original_text_samples'][:3], 1):
+                                            st.code(sample[:300] if len(str(sample)) > 300 else sample, language='text')
+                                    
+                                    if 'source_samples' in debug_info:
+                                        st.write("**元のテキストサンプル（抽出失敗時）:**")
+                                        for i, sample in enumerate(debug_info['source_samples'][:3], 1):
+                                            st.code(sample[:300] if len(str(sample)) > 300 else sample, language='text')
+                                    
+                                    # 検出された列の情報
+                                    if 'detected_order_col' in debug_info:
+                                        st.write("**検出された注文番号列:**", debug_info['detected_order_col'])
+                                    if 'detected_detail_col' in debug_info:
+                                        st.write("**検出された使用状況列:**", debug_info['detected_detail_col'])
+                                    if 'order_id_source_col' in debug_info:
+                                        st.write("**💰 オーダーIDを含む列（金額列検出の基準）:**", debug_info['order_id_source_col'])
+                                        if 'order_id_source_col_index' in debug_info:
+                                            st.write(f"**列のインデックス:** {debug_info['order_id_source_col_index']}")
+                                    
+                                    # 金額列の検出情報
+                                    st.write("---")
+                                    st.write("**💰 金額列の検出情報:**")
+                                    if 'detected_cny_col' in debug_info:
+                                        if debug_info['detected_cny_col'] != '見つかりませんでした':
+                                            st.success(f"✅ 金額（CNY）列: **{debug_info['detected_cny_col']}**")
+                                            if 'cny_col_detection_method' in debug_info:
+                                                st.caption(f"検出方法: {debug_info['cny_col_detection_method']}")
+                                            if 'cny_col_index' in debug_info:
+                                                st.caption(f"列のインデックス: {debug_info['cny_col_index']}")
+                                        else:
+                                            st.error(f"❌ 金額（CNY）列: {debug_info['detected_cny_col']}")
+                                            if 'cny_candidate_columns' in debug_info and debug_info['cny_candidate_columns']:
+                                                st.write("**候補となる列名:**", ', '.join(debug_info['cny_candidate_columns'][:10]))
+                                            # パターンマッチ結果を表示
+                                            if 'cny_pattern_matches' in debug_info and debug_info['cny_pattern_matches']:
+                                                st.write("**🔍 パターンマッチ結果（CNY列）:**")
+                                                for i, match in enumerate(debug_info['cny_pattern_matches'][:10], 1):
+                                                    st.write(f"{i}. {match}")
+                                            else:
+                                                st.info("💡 パターンマッチ結果がありません。列名を確認してください。")
+                                    if 'detected_jpy_col' in debug_info:
+                                        if debug_info['detected_jpy_col'] != '見つかりませんでした':
+                                            st.success(f"✅ 参考金額（JPY）列: **{debug_info['detected_jpy_col']}**")
+                                            if 'jpy_col_detection_method' in debug_info:
+                                                st.caption(f"検出方法: {debug_info['jpy_col_detection_method']}")
+                                            if 'jpy_col_index' in debug_info:
+                                                st.caption(f"列のインデックス: {debug_info['jpy_col_index']}")
+                                        else:
+                                            st.error(f"❌ 参考金額（JPY）列: {debug_info['detected_jpy_col']}")
+                                            if 'jpy_candidate_columns' in debug_info and debug_info['jpy_candidate_columns']:
+                                                st.write("**候補となる列名:**", ', '.join(debug_info['jpy_candidate_columns'][:10]))
+                                            # パターンマッチ結果を表示
+                                            if 'jpy_pattern_matches' in debug_info and debug_info['jpy_pattern_matches']:
+                                                st.write("**🔍 パターンマッチ結果（JPY列）:**")
+                                                for i, match in enumerate(debug_info['jpy_pattern_matches'][:10], 1):
+                                                    st.write(f"{i}. {match}")
+                                            else:
+                                                st.info("💡 パターンマッチ結果がありません。列名を確認してください。")
+                                    
+                                    # すべての列名を表示（金額関連の列を強調）
+                                    if 'all_columns' in debug_info:
+                                        st.write("**📋 record-listファイルのすべての列名:**")
+                                        all_cols = debug_info['all_columns']
+                                        if len(all_cols) > 0:
+                                            # 金額関連の列を強調表示
+                                            amount_cols = debug_info.get('amount_related_columns', [])
+                                            if amount_cols:
+                                                st.write("**💰 金額関連の列（候補）:**")
+                                                for i, col in enumerate(amount_cols[:15], 1):
+                                                    # 列名の長さを確認
+                                                    col_display = str(col)
+                                                    if len(col_display) > 100:
+                                                        col_display = col_display[:100] + "..."
+                                                    st.write(f"{i}. `{col_display}`")
+                                            else:
+                                                st.warning("⚠️ 金額関連の列が見つかりませんでした")
+                                            
+                                            st.write("**📝 すべての列名（最初の30個）:**")
+                                            for i, col in enumerate(all_cols[:30], 1):
+                                                # 列名の長さを確認
+                                                col_display = str(col)
+                                                if len(col_display) > 100:
+                                                    col_display = col_display[:100] + "..."
+                                                # 金額関連の列を強調
+                                                if col in amount_cols:
+                                                    st.write(f"{i}. **`{col_display}`** ⭐ (金額関連)")
+                                                else:
+                                                    st.write(f"{i}. `{col_display}`")
+                                            
+                                            if len(all_cols) > 30:
+                                                st.caption(f"... 他 {len(all_cols) - 30} 個の列")
+                                    
+                                    if 'extraction_reason' in debug_info:
+                                        st.write("**抽出を実行した理由:**", debug_info['extraction_reason'])
                         
                         # 注文番号・金額（CNY）・参考金額（JPY）を表示
                         display_cols = [col for col in ['注文番号', '金額（CNY）', '参考金額（JPY）'] if col in record_df.columns]
                         if display_cols:
+                            # 金額列が含まれているか確認
+                            has_cny = '金額（CNY）' in display_cols
+                            has_jpy = '参考金額（JPY）' in display_cols
+                            
+                            if not has_cny or not has_jpy:
+                                missing_cols = []
+                                if not has_cny:
+                                    missing_cols.append('金額（CNY）')
+                                if not has_jpy:
+                                    missing_cols.append('参考金額（JPY）')
+                                st.warning(f"⚠️ 以下の列が見つかりませんでした: {', '.join(missing_cols)}")
+                                st.info("💡 デバッグ情報を展開して、検出された列名を確認してください。")
+                            
                             st.dataframe(record_df[display_cols], width='stretch', height=200)
                         else:
-                            st.warning("注文番号または金額列が見つかりませんでした")
+                            st.error("❌ 注文番号または金額列が見つかりませんでした")
+                            st.info("💡 デバッグ情報を展開して、検出された列名を確認してください。")
                             st.dataframe(record_df, width='stretch', height=200)
                     else:
                         if missing_orders:
@@ -2131,6 +2712,56 @@ def main():
                             if len(missing_orders) > 10:
                                 missing_list += f" ... 他{len(missing_orders) - 10}個"
                             st.error(f"⚠️ record-list に該当する注文番号が見つかりませんでした。\n\n見つからなかった注文番号: **{missing_list}**")
+                            
+                            # デバッグ情報を表示
+                            if debug_info:
+                                with st.expander("🔍 デバッグ情報を表示", expanded=True):
+                                    if 'error' in debug_info:
+                                        st.error(f"**エラー:** {debug_info['error']}")
+                                    st.write("**抽出方法:**", debug_info.get('extraction_method', 'N/A'))
+                                    st.write("**抽出された注文番号数:**", debug_info.get('extracted_count', 0), f"（全{debug_info.get('total_rows', 0)}行中）")
+                                    
+                                    if 'extracted_samples' in debug_info and debug_info['extracted_samples']:
+                                        st.write("**✅ 抽出された注文番号のサンプル:**", ', '.join(map(str, debug_info['extracted_samples'][:10])))
+                                    else:
+                                        st.warning("**⚠️ 注文番号の抽出に失敗しました**")
+                                    
+                                    if 'available_orders_sample' in debug_info and debug_info['available_orders_sample']:
+                                        st.write(f"**record-listに存在する注文番号:** {debug_info.get('available_orders_count', 0)}個")
+                                        st.write("**サンプル:**", ', '.join(map(str, debug_info['available_orders_sample'][:10])))
+                                    else:
+                                        st.warning("**⚠️ record-listから注文番号を抽出できませんでした**")
+                                    
+                                    if 'search_target_sample' in debug_info:
+                                        st.write("**検索対象の注文番号（send-order-listから）:**", ', '.join(map(str, debug_info['search_target_sample'][:10])))
+                                    
+                                    if 'extraction_test_samples' in debug_info:
+                                        st.write("**🔬 抽出テスト結果（最初の5行）:**")
+                                        for i, test in enumerate(debug_info['extraction_test_samples'][:3], 1):
+                                            st.write(f"**サンプル {i}:**")
+                                            st.code(f"元のテキスト: {test['original']}", language='text')
+                                            if test['extracted']:
+                                                st.success(f"✅ 抽出成功: {test['extracted']}")
+                                            else:
+                                                st.error(f"❌ 抽出失敗")
+                                    
+                                    if 'original_text_samples' in debug_info:
+                                        st.write("**📝 元のテキストサンプル（使用状況の詳細列）:**")
+                                        for i, sample in enumerate(debug_info['original_text_samples'][:3], 1):
+                                            st.code(sample[:300] if len(str(sample)) > 300 else sample, language='text')
+                                    
+                                    if 'source_samples' in debug_info:
+                                        st.write("**元のテキストサンプル（抽出失敗時）:**")
+                                        for i, sample in enumerate(debug_info['source_samples'][:3], 1):
+                                            st.code(sample[:300] if len(str(sample)) > 300 else sample, language='text')
+                                    
+                                    # 検出された列の情報
+                                    if 'detected_order_col' in debug_info:
+                                        st.write("**検出された注文番号列:**", debug_info['detected_order_col'])
+                                    if 'detected_detail_col' in debug_info:
+                                        st.write("**検出された使用状況列:**", debug_info['detected_detail_col'])
+                                    if 'extraction_reason' in debug_info:
+                                        st.write("**抽出を実行した理由:**", debug_info['extraction_reason'])
                         else:
                             st.warning("record-list に該当する注文番号が見つかりませんでした")
                     continue  # display_data_preview をスキップ
@@ -2294,6 +2925,7 @@ def main():
                         # record-list データ
                         record_list_df = pd.DataFrame()
                         missing_record_orders = []
+                        record_list_debug_info = {}
                         if 'record_list' in st.session_state.uploaded_files and not send_order_df.empty:
                             if '注文番号' in send_order_df.columns:
                                 order_numbers = send_order_df['注文番号'].dropna().astype(str).unique().tolist()
@@ -2303,8 +2935,9 @@ def main():
                                     st.session_state.uploaded_files['record_list'],
                                     send_order_matches
                                 )
-                                # 見つからなかった注文番号を取得
+                                # 見つからなかった注文番号とデバッグ情報を取得
                                 missing_record_orders = getattr(record_list_df, 'attrs', {}).get('missing_orders', [])
+                                record_list_debug_info = getattr(record_list_df, 'attrs', {}).get('debug_info', {})
                         
                         progress_bar.progress(60)
                         status_text.text("税金情報を取得しています...")
@@ -2351,6 +2984,56 @@ def main():
                             if len(missing_record_orders) > 10:
                                 missing_list += f" ... 他{len(missing_record_orders) - 10}個"
                             st.error(f"⚠️ 以下の注文番号が record-list に存在しません: **{missing_list}**\n\nこれらの注文番号のデータを確認してください。")
+                            
+                            # デバッグ情報を表示
+                            if record_list_debug_info:
+                                with st.expander("🔍 record-list検索のデバッグ情報", expanded=False):
+                                    if 'error' in record_list_debug_info:
+                                        st.error(f"**エラー:** {record_list_debug_info['error']}")
+                                    st.write("**抽出方法:**", record_list_debug_info.get('extraction_method', 'N/A'))
+                                    st.write("**抽出された注文番号数:**", record_list_debug_info.get('extracted_count', 0), f"（全{record_list_debug_info.get('total_rows', 0)}行中）")
+                                    
+                                    if 'extracted_samples' in record_list_debug_info and record_list_debug_info['extracted_samples']:
+                                        st.write("**✅ 抽出された注文番号のサンプル:**", ', '.join(map(str, record_list_debug_info['extracted_samples'][:10])))
+                                    else:
+                                        st.warning("**⚠️ 注文番号の抽出に失敗しました**")
+                                    
+                                    if 'available_orders_sample' in record_list_debug_info and record_list_debug_info['available_orders_sample']:
+                                        st.write(f"**record-listに存在する注文番号:** {record_list_debug_info.get('available_orders_count', 0)}個")
+                                        st.write("**サンプル:**", ', '.join(map(str, record_list_debug_info['available_orders_sample'][:10])))
+                                    else:
+                                        st.warning("**⚠️ record-listから注文番号を抽出できませんでした**")
+                                    
+                                    if 'search_target_sample' in record_list_debug_info:
+                                        st.write("**検索対象の注文番号（send-order-listから）:**", ', '.join(map(str, record_list_debug_info['search_target_sample'][:10])))
+                                    
+                                    if 'extraction_test_samples' in record_list_debug_info:
+                                        st.write("**🔬 抽出テスト結果（最初の5行）:**")
+                                        for i, test in enumerate(record_list_debug_info['extraction_test_samples'][:3], 1):
+                                            st.write(f"**サンプル {i}:**")
+                                            st.code(f"元のテキスト: {test['original']}", language='text')
+                                            if test['extracted']:
+                                                st.success(f"✅ 抽出成功: {test['extracted']}")
+                                            else:
+                                                st.error(f"❌ 抽出失敗")
+                                    
+                                    if 'original_text_samples' in record_list_debug_info:
+                                        st.write("**📝 元のテキストサンプル（使用状況の詳細列）:**")
+                                        for i, sample in enumerate(record_list_debug_info['original_text_samples'][:3], 1):
+                                            st.code(sample[:300] if len(str(sample)) > 300 else sample, language='text')
+                                    
+                                    if 'source_samples' in record_list_debug_info:
+                                        st.write("**元のテキストサンプル（抽出失敗時）:**")
+                                        for i, sample in enumerate(record_list_debug_info['source_samples'][:3], 1):
+                                            st.code(sample[:300] if len(str(sample)) > 300 else sample, language='text')
+                                    
+                                    # 検出された列の情報
+                                    if 'detected_order_col' in record_list_debug_info:
+                                        st.write("**検出された注文番号列:**", record_list_debug_info['detected_order_col'])
+                                    if 'detected_detail_col' in record_list_debug_info:
+                                        st.write("**検出された使用状況列:**", record_list_debug_info['detected_detail_col'])
+                                    if 'extraction_reason' in record_list_debug_info:
+                                        st.write("**抽出を実行した理由:**", record_list_debug_info['extraction_reason'])
                         
                         # エラーがあれば表示
                         if hasattr(results_df, 'attrs') and 'errors' in results_df.attrs:
