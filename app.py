@@ -205,13 +205,18 @@ def load_table_with_html_fallback(filepath: str, nrows: Optional[int] = None) ->
     header = raw[:200].lower()
     if b'<html' in header or b'<!doctype html' in header:
         text = raw.decode('utf-8', errors='replace')
-        tables = pd.read_html(StringIO(text))
-        if tables:
-            df = tables[0]
-            if nrows:
-                df = df.head(nrows)
-            return df, 'html'
-        raise Exception("HTMLテーブルを解析できませんでした")
+        try:
+            tables = pd.read_html(StringIO(text))
+            if tables:
+                df = tables[0]
+                if nrows:
+                    df = df.head(nrows)
+                return df, 'html'
+            raise Exception("HTMLテーブルを解析できませんでした")
+        except ImportError as e:
+            if 'html5lib' in str(e).lower():
+                raise Exception("html5libライブラリが必要です。システム管理者に連絡して、'pip install html5lib' を実行してもらってください。")
+            raise
     last_error = None
     for engine in ['openpyxl', 'xlrd']:
         try:
@@ -221,12 +226,17 @@ def load_table_with_html_fallback(filepath: str, nrows: Optional[int] = None) ->
             last_error = exc
             continue
     text = raw.decode('utf-8', errors='replace')
-    tables = pd.read_html(StringIO(text))
-    if tables:
-        df = tables[0]
-        if nrows:
-            df = df.head(nrows)
-        return df, 'html'
+    try:
+        tables = pd.read_html(StringIO(text))
+        if tables:
+            df = tables[0]
+            if nrows:
+                df = df.head(nrows)
+            return df, 'html'
+    except ImportError as e:
+        if 'html5lib' in str(e).lower():
+            raise Exception("html5libライブラリが必要です。システム管理者に連絡して、'pip install html5lib' を実行してもらってください。")
+        raise
     raise last_error or Exception("ファイルが読み込めませんでした")
 
 
@@ -267,7 +277,12 @@ def display_data_preview(file_type: str, file_path: str, show_header: bool = Tru
             caption += "（HTMLテーブルとして読み込みました）"
         st.caption(caption)
     except Exception as e:
-        st.error(f"{file_type} の読み込みエラー: {str(e)}")
+        error_msg = str(e)
+        # html5libのエラーの場合、対処方法を表示
+        if 'html5lib' in error_msg.lower():
+            st.error(f"**{file_type} の読み込みエラー**\n\n{error_msg}\n\n**対処方法:**\nシステム管理者に連絡して、以下のコマンドでhtml5libをインストールしてもらってください:\n```bash\npip install html5lib\n```\nまたは、requirements.txtにhtml5libが含まれているか確認してください。")
+        else:
+            st.error(f"{file_type} の読み込みエラー: {error_msg}")
 
 
 def display_metadata_header(metadata: Dict[str, str]):
@@ -1057,11 +1072,25 @@ def get_record_list_preview(order_numbers: List[str], file_path: str, asin_order
                 expanded_orders.append(str(order))
         
         # フィルタリング
-        mask = df[order_col].astype(str).str.strip().isin([str(o).strip() for o in expanded_orders])
+        df_order_str = df[order_col].astype(str).str.strip()
+        expanded_orders_str = [str(o).strip() for o in expanded_orders]
+        mask = df_order_str.isin(expanded_orders_str)
         subset = df[mask].copy()
         
+        # 見つかった注文番号を記録
+        found_orders = set(subset[order_col].astype(str).str.strip().unique())
+        missing_orders = [o for o in expanded_orders_str if o not in found_orders]
+        
+        # 見つからなかった注文番号をDataFrameの属性として保存
+        if missing_orders:
+            subset.attrs = getattr(subset, 'attrs', {})
+            subset.attrs['missing_orders'] = missing_orders
+        
         if subset.empty:
-            return pd.DataFrame()
+            # 空の場合でも見つからなかった注文番号を保存
+            empty_df = pd.DataFrame()
+            empty_df.attrs = {'missing_orders': missing_orders}
+            return empty_df
         
         # 必要な列だけを抽出
         result_cols = [order_col]
@@ -1190,8 +1219,12 @@ def get_send_order_preview(asins: List[str], file_path: str) -> pd.DataFrame:
                 axis=1
             )
     
+    # 商品金額列の名前を変更
+    if '商品金額' in df.columns:
+        df = df.rename(columns={'商品金額': '商品金額（元）'})
+    
     # reorder columns
-    desired_order = ['ASIN', '注文番号', '単価（元）', '数量', '中国国内送料（元）', '顧客管理番号（番号）', '商品金額']
+    desired_order = ['ASIN', '注文番号', '単価（元）', '数量', '中国国内送料（元）', '顧客管理番号（番号）', '商品金額（元）']
     available = [col for col in desired_order if col in df.columns]
     other_cols = [col for col in df.columns if col not in available]
     return df[available + other_cols]
@@ -2053,10 +2086,12 @@ def main():
                         styled_send_order = detail_df.style.apply(highlight_send_order_cost_columns, axis=None)
                         format_dict = {}
                         for col in detail_df.columns:
-                            if '単価' in col or '送料' in col:
+                            # 元の金額：小数点第2位まで表示
+                            if '単価' in col or '送料' in col or '商品金額' in col or '（元）' in col:
                                 format_dict[col] = '{:,.2f}'
-                            elif col == '数量':
-                                format_dict[col] = '{:,.0f}'
+                            # 数量：小数点第1位まで表示
+                            elif col == '数量' or '数量' in col:
+                                format_dict[col] = '{:,.1f}'
                         styled_send_order = styled_send_order.format(format_dict, na_rep='-')
                         
                         st.dataframe(styled_send_order, width='stretch', height=200)
@@ -2070,9 +2105,19 @@ def main():
                 
                 if file_type == 'record_list' and order_numbers:
                     record_df = get_record_list_preview(order_numbers, file_path, send_order_matches)
+                    missing_orders = getattr(record_df, 'attrs', {}).get('missing_orders', [])
+                    
                     if not record_df.empty:
                         st.subheader("📄 record_listのプレビュー")
                         st.caption(f"send-order-listの注文番号: {len(order_numbers)}個 | record-listで見つかった件数: {len(record_df)}件")
+                        
+                        # 見つからなかった注文番号がある場合は警告を表示
+                        if missing_orders:
+                            missing_list = ', '.join(missing_orders[:10])  # 最初の10個まで表示
+                            if len(missing_orders) > 10:
+                                missing_list += f" ... 他{len(missing_orders) - 10}個"
+                            st.error(f"⚠️ 以下の注文番号が record-list に存在しません: **{missing_list}**")
+                        
                         # 注文番号・金額（CNY）・参考金額（JPY）を表示
                         display_cols = [col for col in ['注文番号', '金額（CNY）', '参考金額（JPY）'] if col in record_df.columns]
                         if display_cols:
@@ -2081,7 +2126,13 @@ def main():
                             st.warning("注文番号または金額列が見つかりませんでした")
                             st.dataframe(record_df, width='stretch', height=200)
                     else:
-                        st.warning("record-list に該当する注文番号が見つかりませんでした")
+                        if missing_orders:
+                            missing_list = ', '.join(missing_orders[:10])  # 最初の10個まで表示
+                            if len(missing_orders) > 10:
+                                missing_list += f" ... 他{len(missing_orders) - 10}個"
+                            st.error(f"⚠️ record-list に該当する注文番号が見つかりませんでした。\n\n見つからなかった注文番号: **{missing_list}**")
+                        else:
+                            st.warning("record-list に該当する注文番号が見つかりませんでした")
                     continue  # display_data_preview をスキップ
                 
                 if file_type == 'import_permit':
@@ -2242,6 +2293,7 @@ def main():
                         
                         # record-list データ
                         record_list_df = pd.DataFrame()
+                        missing_record_orders = []
                         if 'record_list' in st.session_state.uploaded_files and not send_order_df.empty:
                             if '注文番号' in send_order_df.columns:
                                 order_numbers = send_order_df['注文番号'].dropna().astype(str).unique().tolist()
@@ -2251,6 +2303,8 @@ def main():
                                     st.session_state.uploaded_files['record_list'],
                                     send_order_matches
                                 )
+                                # 見つからなかった注文番号を取得
+                                missing_record_orders = getattr(record_list_df, 'attrs', {}).get('missing_orders', [])
                         
                         progress_bar.progress(60)
                         status_text.text("税金情報を取得しています...")
@@ -2290,6 +2344,13 @@ def main():
                         
                         st.markdown('<div class="success-box">✅ 処理が完了しました！</div>', unsafe_allow_html=True)
                         st.info(f"**処理された商品数:** {len(results_df)} 個")
+                        
+                        # record-listで見つからなかった注文番号を表示
+                        if missing_record_orders:
+                            missing_list = ', '.join(missing_record_orders[:10])  # 最初の10個まで表示
+                            if len(missing_record_orders) > 10:
+                                missing_list += f" ... 他{len(missing_record_orders) - 10}個"
+                            st.error(f"⚠️ 以下の注文番号が record-list に存在しません: **{missing_list}**\n\nこれらの注文番号のデータを確認してください。")
                         
                         # エラーがあれば表示
                         if hasattr(results_df, 'attrs') and 'errors' in results_df.attrs:
