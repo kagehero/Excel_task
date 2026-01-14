@@ -2457,7 +2457,7 @@ def main():
                 instruction_df = get_instruction_summary(st.session_state.uploaded_files['fba'])
                 if not instruction_df.empty:
                     asins = instruction_df['ASIN'].dropna().astype(str).tolist()
-                    st.subheader("📄 fbaのプレビュー")
+                    st.subheader("📄 FBA指示書のプレビュー")
                     
                     # オプション費用列をハイライト
                     def highlight_fba_option_cost(df):
