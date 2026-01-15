@@ -433,7 +433,8 @@ def get_instruction_summary(file_path: str) -> pd.DataFrame:
         
         asin_col = find_matching_column(df, ['ASIN', 'asin', 'ASIN番号'])
         product_col = find_matching_column(df, ['商品名', '商品名称', 'product_name', '商品'])
-        qty_col = find_matching_column(df, ['数量', '個数', 'qty', '数量(個)', '納品個数'])
+        # E列「納品個数」を優先的に検出（原価計算の基準）
+        qty_col = find_matching_column(df, ['納品個数', '数量', '個数', 'qty', '数量(個)'])
         
         # promote_header_row前に保存したオプション費用データがあれば使用
         option_col = None
@@ -2476,8 +2477,13 @@ def main():
                     styled_fba = styled_fba.format(format_dict, na_rep='-')
                     
                     st.dataframe(styled_fba, width='stretch', height=250)
+                    
+                    # 突合チェック結果を表示（後でsend_orderと比較）
+                    # ここでは一時的にプレースホルダーを表示
+                    st.session_state['instruction_asins'] = asins
             order_numbers = []
             send_order_matches = pd.DataFrame()
+            send_order_asins = []
             for file_type, file_path in st.session_state.uploaded_files.items():
                 if not file_path or not os.path.exists(file_path):
                     continue
@@ -2512,7 +2518,38 @@ def main():
                     detail_df = get_send_order_preview(asins, file_path)
                     if not detail_df.empty:
                         st.subheader("📄 send_orderのプレビュー")
-                        st.caption(f"指示書の商品数: {len(asins)}個 | 表示中: {len(detail_df)}個")
+                        
+                        # 突合チェック結果を表示
+                        send_order_asins = detail_df['ASIN'].dropna().astype(str).unique().tolist() if 'ASIN' in detail_df.columns else []
+                        instruction_asins = st.session_state.get('instruction_asins', asins)
+                        
+                        # 指示書のASINとsend_orderのASINを比較
+                        instruction_set = set(instruction_asins)
+                        send_order_set = set(send_order_asins)
+                        
+                        missing_in_send_order = instruction_set - send_order_set
+                        extra_in_send_order = send_order_set - instruction_set
+                        
+                        if not missing_in_send_order and not extra_in_send_order:
+                            # 一致
+                            st.success(f"✔ 突合結果：一致（指示書 {len(instruction_asins)}件 / send_order {len(send_order_asins)}件）")
+                        else:
+                            # 不一致
+                            missing_list = ', '.join(list(missing_in_send_order)[:10])
+                            if len(missing_in_send_order) > 10:
+                                missing_list += f" ... 他{len(missing_in_send_order) - 10}件"
+                            
+                            st.error(
+                                f"⚠ 突合結果：不一致（指示書 {len(instruction_asins)}件 / send_order {len(send_order_asins)}件）\n\n"
+                                f"**不足件数：{len(missing_in_send_order)}件**\n"
+                                f"**不足ASIN：** {missing_list if missing_in_send_order else 'なし'}"
+                            )
+                            
+                            if extra_in_send_order:
+                                extra_list = ', '.join(list(extra_in_send_order)[:10])
+                                if len(extra_in_send_order) > 10:
+                                    extra_list += f" ... 他{len(extra_in_send_order) - 10}件"
+                                st.warning(f"**send_orderにのみ存在：** {extra_list}")
                         
                         # 原価計算に使用される列をハイライト
                         def highlight_send_order_cost_columns(df):
