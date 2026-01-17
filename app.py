@@ -36,7 +36,7 @@ st.set_page_config(
 st.markdown("""
 <style>
     .main-header {
-        font-size: 2.5rem;
+        font-size: 1.8rem;
         font-weight: bold;
         color: #1f77b4;
         text-align: center;
@@ -46,7 +46,7 @@ st.markdown("""
         border-radius: 10px;
     }
     .section-header {
-        font-size: 1.5rem;
+        font-size: 1.1rem;
         font-weight: bold;
         color: #2c3e50;
         margin-top: 2rem;
@@ -98,7 +98,7 @@ st.markdown("""
         border-radius: 8px;
     }
     .arrow {
-        font-size: 2rem;
+        font-size: 1.5rem;
         color: #3498db;
         margin: 0 1rem;
     }
@@ -108,6 +108,24 @@ st.markdown("""
         border-radius: 8px;
         box-shadow: 0 2px 4px rgba(0,0,0,0.1);
         margin: 0.5rem;
+    }
+    /* メトリクスのフォントサイズ調整 */
+    div[data-testid="stMetricValue"] {
+        font-size: 0.8rem !important;
+        font-weight: 600;
+        line-height: 1.3;
+    }
+    div[data-testid="stMetricLabel"] {
+        font-size: 0.7rem !important;
+        margin-bottom: 0.2rem !important;
+    }
+    .stMetric {
+        padding: 0.4rem 0.6rem !important;
+        min-height: auto !important;
+    }
+    /* メトリクス値の大きな数値用の調整 */
+    .stMetric > div {
+        font-size: 0.8rem !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -459,10 +477,43 @@ def get_instruction_summary(file_path: str) -> pd.DataFrame:
         if not asin_col or not qty_col:
             return pd.DataFrame()
         
+        # 注文番号列を検出（groupby前のデータから取得するため）
+        # H列は「商品ID」という名前の場合もあるため、それも検索対象に追加
+        order_no_col = find_matching_column(df, ['注文番号', '注文ID', 'order_no', 'order number', 'オーダー番号', '商品ID'])
+        if not order_no_col:
+            # 列名で見つからない場合、「注文」「商品ID」を含む列を探す
+            log_print(f"\n注文番号列を検出中...")
+            for idx, col in enumerate(df.columns):
+                col_str = str(col).lower()
+                if '注文' in col_str or 'order' in col_str or 'オーダー' in col_str or '商品id' in col_str or '商品id' in col_str:
+                    log_print(f"  候補列[{idx}]: '{col}'")
+                    # 数値らしい値があるか確認
+                    sample_values = df[col].dropna().astype(str).head(10).tolist()
+                    numeric_count = sum(1 for v in sample_values if v.replace('.', '').replace('-', '').isdigit() and len(str(v).strip()) > 0)
+                    if numeric_count > 0 or len(sample_values) > 0:
+                        order_no_col = col
+                        log_print(f"  → 注文番号列として使用: '{col}'")
+                        break
+        
+        # まだ見つからない場合、ASIN列の位置からH列を推測（ASIN列がA列の場合、H列はインデックス-1）
+        if not order_no_col and asin_col:
+            asin_idx = list(df.columns).index(asin_col)
+            h_col_idx = asin_idx - 1  # H列はASIN列の1つ前
+            if h_col_idx >= 0 and h_col_idx < len(df.columns):
+                potential_h_col = df.columns[h_col_idx]
+                log_print(f"\nASIN列の位置からH列を推測: ASIN列={asin_idx} → H列候補={h_col_idx} ('{potential_h_col}')")
+                # サンプル値を確認
+                sample_values = df[potential_h_col].dropna().astype(str).head(10).tolist()
+                if len(sample_values) > 0:
+                    order_no_col = potential_h_col
+                    log_print(f"  → H列として使用: '{potential_h_col}' (サンプル値: {sample_values[:3]})")
+        
         # 必須列をコピー
         cols_to_copy = [asin_col, qty_col]
         if product_col:
             cols_to_copy.append(product_col)
+        if order_no_col:
+            cols_to_copy.append(order_no_col)
         
         log_print(f"\nコピーする列: {cols_to_copy}")
         summary = df[cols_to_copy].copy()
@@ -500,6 +551,8 @@ def get_instruction_summary(file_path: str) -> pd.DataFrame:
             rename_map[product_col] = '商品名'
         if 'オプション費用（元）_raw' in summary.columns:
             rename_map['オプション費用（元）_raw'] = 'オプション費用（元）'
+        if order_no_col and order_no_col in summary.columns:
+            rename_map[order_no_col] = '注文番号_temp'
         summary = summary.rename(columns=rename_map)
         summary = summary[pd.notna(summary['ASIN'])]
         
@@ -532,8 +585,12 @@ def get_instruction_summary(file_path: str) -> pd.DataFrame:
         agg_dict = {'数量': 'sum'}
         if 'オプション費用（元）' in summary.columns:
             agg_dict['オプション費用（元）'] = 'sum'  # オプション費用も合計
+        # 注文番号列はgroupby時に削除（すでに取得済み）
         
         summary = summary.groupby(agg_cols, dropna=False, as_index=False).agg(agg_dict)
+        # 注文番号列を削除（groupby後は不要）
+        if '注文番号_temp' in summary.columns:
+            summary = summary.drop(columns=['注文番号_temp'])
         summary['数量'] = summary['数量'].fillna(0).infer_objects(copy=False)
         if 'オプション費用（元）' in summary.columns:
             summary['オプション費用（元）'] = summary['オプション費用（元）'].fillna(0).infer_objects(copy=False)
@@ -541,11 +598,75 @@ def get_instruction_summary(file_path: str) -> pd.DataFrame:
             log_print(f"\n=== オプション費用合計（groupby後・ASIN単位）: {option_total_after}元 ===")
             log_print(f"ASIN数: {len(summary)}個")
         
+        # 注文番号を取得（groupby前のデータから） - groupby前に実行する必要がある
+        instruction_order_numbers = []
+        # groupby前のデータから注文番号を取得
+        if order_no_col and order_no_col in df.columns:
+            # promote_header_row後のデータから注文番号を取得
+            order_nos_raw = df[order_no_col].dropna().astype(str).tolist()
+            log_print(f"\n注文番号列（groupby前・promote_header_row後）から {len(order_nos_raw)}件のデータを取得")
+            
+            # カンマ区切りの場合も考慮
+            for order_no in order_nos_raw:
+                order_str = str(order_no).strip()
+                if not order_str or order_str == 'nan' or order_str == '':
+                    continue
+                if ',' in order_str:
+                    instruction_order_numbers.extend([o.strip() for o in order_str.split(',')])
+                else:
+                    instruction_order_numbers.append(order_str)
+            
+            # 空文字列とnanを除外
+            instruction_order_numbers = [o for o in instruction_order_numbers if o and o != 'nan' and o != '']
+            log_print(f"指示書の注文番号列（H列）から取得: {len(set(instruction_order_numbers))}件（重複除く、ASINごとの合計）")
+            log_print(f"  全注文番号: {len(instruction_order_numbers)}件")
+            log_print(f"  ユニークな注文番号: {len(set(instruction_order_numbers))}件")
+            log_print(f"  サンプル: {list(set(instruction_order_numbers))[:5]}")
+        elif '注文番号_temp' in summary.columns:
+            # groupby前のsummaryから注文番号を取得（フォールバック）
+            order_nos_raw = summary['注文番号_temp'].dropna().astype(str).tolist()
+            log_print(f"\n注文番号列（groupby前・summaryから）から {len(order_nos_raw)}件のデータを取得")
+            
+            # カンマ区切りの場合も考慮
+            for order_no in order_nos_raw:
+                order_str = str(order_no).strip()
+                if not order_str or order_str == 'nan' or order_str == '':
+                    continue
+                if ',' in order_str:
+                    instruction_order_numbers.extend([o.strip() for o in order_str.split(',')])
+                else:
+                    instruction_order_numbers.append(order_str)
+            
+            # 空文字列とnanを除外
+            instruction_order_numbers = [o for o in instruction_order_numbers if o and o != 'nan' and o != '']
+            log_print(f"指示書の注文番号列（H列）から取得: {len(set(instruction_order_numbers))}件（重複除く、ASINごとの合計）")
+            log_print(f"  全注文番号: {len(instruction_order_numbers)}件")
+            log_print(f"  ユニークな注文番号: {len(set(instruction_order_numbers))}件")
+            log_print(f"  サンプル: {list(set(instruction_order_numbers))[:5]}")
+        else:
+            log_print(f"\n⚠️ 注文番号列（H列/商品ID列）が見つかりませんでした。")
+            log_print(f"  order_no_col: {order_no_col}")
+            log_print(f"  df.columns: {list(df.columns)}")
+            log_print(f"  summary.columns: {list(summary.columns)}")
+            if asin_col:
+                asin_idx = list(df.columns).index(asin_col)
+                log_print(f"  ASIN列のインデックス: {asin_idx}")
+                log_print(f"  H列の期待インデックス: {asin_idx - 1}")
+                if asin_idx - 1 >= 0 and asin_idx - 1 < len(df.columns):
+                    log_print(f"  H列の候補列名: '{df.columns[asin_idx - 1]}'")
+                    log_print(f"  H列のサンプル値: {df[df.columns[asin_idx - 1]].dropna().head(5).tolist()}")
+        
         log_print(f"\nAfter groupby (B0BKFS9N54):")
         b0bkfs9n54_final = summary[summary['ASIN'] == 'B0BKFS9N54']
         if not b0bkfs9n54_final.empty:
             for i, row in b0bkfs9n54_final.iterrows():
                 log_print(f"  {row.to_dict()}")
+        
+        # 注文番号数も保存するため、DataFrameに属性として追加
+        # H列の各セルに入力された注文番号の個数の総和（重複を含む全個数）をカウント
+        instruction_order_count = len(instruction_order_numbers)
+        summary.attrs = {'instruction_order_count': instruction_order_count}
+        log_print(f"\n保存する注文番号数（H列の総和）: {instruction_order_count}件（重複含む全個数）")
         
         # すべての列を返す
         return_cols = [col for col in ['商品名', 'ASIN', '数量', 'オプション費用（元）'] if col in summary.columns]
@@ -553,7 +674,11 @@ def get_instruction_summary(file_path: str) -> pd.DataFrame:
         log_print(f"最終データフレーム形状: {summary[return_cols].shape}")
         log_print(f"{'='*80}\n")
         
-        return summary[return_cols]
+        # return_colsで選択したDataFrameにもattrsをコピー（attrsは自動的にコピーされないため）
+        result_df = summary[return_cols].copy()
+        result_df.attrs = {'instruction_order_count': instruction_order_count}
+        
+        return result_df
     except Exception as e:
         log_print(f"\n❌ Error in get_instruction_summary: {e}")
         import traceback
@@ -2049,7 +2174,7 @@ def display_data_flow():
     for i, step in enumerate(flow_steps):
         col1, col2, col3 = st.columns([1, 8, 1])
         with col1:
-            st.markdown(f'<div style="text-align: center; font-size: 2rem;">{step["icon"]}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div style="text-align: center; font-size: 1.5rem;">{step["icon"]}</div>', unsafe_allow_html=True)
         with col2:
             st.markdown(
                 f'<div class="info-box">'
@@ -2478,6 +2603,20 @@ def main():
                     
                     st.dataframe(styled_fba, width='stretch', height=250)
                     
+                    # 数量合計とオプション費用合計を表示
+                    total_qty = instruction_df['数量'].sum() if '数量' in instruction_df.columns else 0
+                    total_option_cost = instruction_df['オプション費用（元）'].sum() if 'オプション費用（元）' in instruction_df.columns else 0
+                    instruction_order_count = getattr(instruction_df, 'attrs', {}).get('instruction_order_count', 0)
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("指示書の数量合計", f"{total_qty:,.0f}個")
+                    with col2:
+                        st.metric("オプション費用合計", f"{total_option_cost:,.2f}元")
+                    with col3:
+                        if instruction_order_count > 0:
+                            st.metric("指示書の注文番号数（H列）", f"{instruction_order_count}件")
+                    
                     # 突合チェック結果を表示（後でsend_orderと比較）
                     # ここでは一時的にプレースホルダーを表示
                     st.session_state['instruction_asins'] = asins
@@ -2507,8 +2646,8 @@ def main():
                         styled_jancode = detail_df.style.apply(highlight_jancode_dimensions, axis=None)
                         format_dict = {}
                         for col in detail_df.columns:
-                            if 'cm' in col or '寸法' in col:
-                                format_dict[col] = '{:,.2f}'
+                            if 'cm' in col or '寸法' in col or '体積' in col:
+                                format_dict[col] = '{:,.1f}'
                         styled_jancode = styled_jancode.format(format_dict, na_rep='-')
                         
                         st.dataframe(styled_jancode, width='stretch', height=250)
@@ -2572,9 +2711,79 @@ def main():
                         styled_send_order = styled_send_order.format(format_dict, na_rep='-')
                         
                         st.dataframe(styled_send_order, width='stretch', height=200)
-                        if '注文番号' in detail_df.columns:
-                            order_numbers = detail_df['注文番号'].dropna().astype(str).unique().tolist()
-                            send_order_matches = detail_df[['ASIN', '注文番号']].drop_duplicates()
+                        
+                        # send-order-list全体から注文番号を取得（ASINごとに集約される前のデータ）
+                        send_order_df_full = None
+                        try:
+                            send_order_df_full, _ = load_table_with_html_fallback(file_path)
+                            send_order_df_full.columns = send_order_df_full.columns.str.strip()
+                            header_keywords = ['ASIN', '注文', 'order', 'customer']
+                            send_order_df_full = promote_header_row(send_order_df_full, header_keywords)
+                            
+                            order_col_full = find_matching_column(send_order_df_full, ['注文番号', '注文ID', 'order_no', 'order number', 'オーダー番号'])
+                            if order_col_full:
+                                # 注文番号を取得（カンマ区切りも考慮）
+                                all_order_nos = send_order_df_full[order_col_full].dropna().astype(str).tolist()
+                                order_numbers_set = set()
+                                for order_no in all_order_nos:
+                                    if ',' in str(order_no):
+                                        order_numbers_set.update([o.strip() for o in str(order_no).split(',')])
+                                    else:
+                                        order_numbers_set.add(str(order_no).strip())
+                                order_numbers = [o for o in order_numbers_set if o and o != 'nan']
+                                # より明確に区別するため、メトリクス形式で表示
+                                col1, col2 = st.columns(2)
+                                with col1:
+                                    st.metric("send-order-listのASIN数", f"{len(send_order_asins)}個")
+                                with col2:
+                                    st.metric("send-order-listの注文番号数", f"{len(order_numbers)}件")
+                            else:
+                                # 注文番号列が見つからない場合はdetail_dfから取得（フォールバック）
+                                if '注文番号' in detail_df.columns:
+                                    # カンマ区切りの注文番号を展開
+                                    all_order_strs = detail_df['注文番号'].dropna().astype(str).tolist()
+                                    order_numbers_set = set()
+                                    for order_str in all_order_strs:
+                                        if ',' in str(order_str):
+                                            order_numbers_set.update([o.strip() for o in str(order_str).split(',')])
+                                        else:
+                                            order_numbers_set.add(str(order_str).strip())
+                                    order_numbers = [o for o in order_numbers_set if o and o != 'nan']
+                                    # より明確に区別するため、メトリクス形式で表示
+                                    col1, col2 = st.columns(2)
+                                    with col1:
+                                        st.metric("send-order-listのASIN数", f"{len(send_order_asins)}個")
+                                    with col2:
+                                        st.metric("send-order-listの注文番号数（推測）", f"{len(order_numbers)}件")
+                                else:
+                                    order_numbers = []
+                                    col1, col2 = st.columns(2)
+                                    with col1:
+                                        st.metric("send-order-listのASIN数", f"{len(send_order_asins)}個")
+                                    with col2:
+                                        st.warning("注文番号列が見つかりません")
+                        except Exception as e:
+                            # エラー時はdetail_dfから取得（フォールバック）
+                            if '注文番号' in detail_df.columns:
+                                all_order_strs = detail_df['注文番号'].dropna().astype(str).tolist()
+                                order_numbers_set = set()
+                                for order_str in all_order_strs:
+                                    if ',' in str(order_str):
+                                        order_numbers_set.update([o.strip() for o in str(order_str).split(',')])
+                                    else:
+                                        order_numbers_set.add(str(order_str).strip())
+                                order_numbers = [o for o in order_numbers_set if o and o != 'nan']
+                                # より明確に区別するため、メトリクス形式で表示
+                                col1, col2 = st.columns(2)
+                                with col1:
+                                    st.metric("send-order-listのASIN数", f"{len(send_order_asins)}個")
+                                with col2:
+                                    st.metric("send-order-listの注文番号数（推測）", f"{len(order_numbers)}件")
+                            else:
+                                order_numbers = []
+                        
+                        if order_numbers:
+                            send_order_matches = detail_df[['ASIN', '注文番号']].drop_duplicates() if '注文番号' in detail_df.columns else pd.DataFrame()
                     continue  # display_data_preview をスキップ
                 
                 if file_type == 'fba':
@@ -2587,7 +2796,20 @@ def main():
                     
                     if not record_df.empty:
                         st.subheader("📄 record_listのプレビュー")
-                        st.caption(f"send-order-listの注文番号: {len(order_numbers)}個 | record-listで見つかった件数: {len(record_df)}件")
+                        # 指示書の注文番号数も取得
+                        instruction_order_count = 0
+                        if 'fba' in st.session_state.uploaded_files:
+                            instruction_df_check = get_instruction_summary(st.session_state.uploaded_files['fba'])
+                            instruction_order_count = getattr(instruction_df_check, 'attrs', {}).get('instruction_order_count', 0)
+                        
+                        # 突合チェックの件数をメトリクス形式で表示
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("指示書の注文番号数（H列）", f"{instruction_order_count}件")
+                        with col2:
+                            st.metric("send-order-listの注文番号数", f"{len(order_numbers)}件")
+                        with col3:
+                            st.metric("record-listで見つかった件数", f"{len(record_df)}件")
                         
                         # 見つからなかった注文番号がある場合は警告を表示
                         if missing_orders:
@@ -2845,7 +3067,7 @@ def main():
                     # 抽出された値を表示（原価計算に使用される関税のみハイライト）
                     st.markdown("""
                     <div style="margin-bottom: 10px; padding: 8px; background-color: #F8FAFB; border-radius: 6px; border-left: 4px solid #4A90A4;">
-                        <span style="font-size: 12px; color: #2E5266;">💡 <strong>関税</strong>は原価計算に使用されます</span>
+                        <span style="font-size: 10px; color: #2E5266;">💡 <strong>関税</strong>は原価計算に使用されます</span>
                     </div>
                     """, unsafe_allow_html=True)
                     
@@ -2854,8 +3076,8 @@ def main():
                         if tax_data['関税'] is not None and tax_data['関税'] > 0:
                             st.markdown(f"""
                             <div style="padding: 15px; background-color: #E8F4F8; border-left: 4px solid #4A90A4; border-radius: 6px;">
-                                <div style="font-size: 12px; color: #6B7280; font-weight: 500;">関税 ✓</div>
-                                <div style="font-size: 24px; color: #2E5266; font-weight: 700; margin-top: 5px;">¥{tax_data['関税']:,.0f}</div>
+                                <div style="font-size: 10px; color: #6B7280; font-weight: 500;">関税 ✓</div>
+                                <div style="font-size: 18px; color: #2E5266; font-weight: 700; margin-top: 5px;">¥{tax_data['関税']:,.0f}</div>
                             </div>
                             """, unsafe_allow_html=True)
                         else:
@@ -3154,6 +3376,8 @@ def main():
                     format_dict[col] = '{:,.2f}'
                 elif col == '数量':
                     format_dict[col] = '{:,.0f}'
+                elif 'cm' in col or '寸法' in col or '体積' in col:
+                    format_dict[col] = '{:,.1f}'
             
             styled_df = styled_df.format(format_dict, na_rep='-')
             
@@ -3163,13 +3387,13 @@ def main():
                 <div style="display: flex; align-items: center; gap: 20px; flex-wrap: wrap;">
                     <div style="display: flex; align-items: center; gap: 8px;">
                         <div style="width: 20px; height: 20px; background-color: #E8F4F8; border-left: 3px solid #4A90A4; border-radius: 3px;"></div>
-                        <span style="font-size: 13px; color: #2E5266;">原価計算に使用</span>
+                        <span style="font-size: 11px; color: #2E5266;">原価計算に使用</span>
                     </div>
                     <div style="display: flex; align-items: center; gap: 8px;">
                         <div style="width: 20px; height: 20px; background-color: #D1E7F0; border-left: 3px solid #2E5266; border-radius: 3px;"></div>
-                        <span style="font-size: 13px; color: #2E5266; font-weight: 600;">原価（合計）</span>
+                        <span style="font-size: 11px; color: #2E5266; font-weight: 600;">原価（合計）</span>
                     </div>
-                    <span style="font-size: 12px; color: #6B7280; margin-left: 10px;">
+                    <span style="font-size: 10px; color: #6B7280; margin-left: 10px;">
                         💡 原価 = 購入単価 + 中国国内送料 + オプション費用 + 国際送料 + 関税
                     </span>
                 </div>
@@ -3216,7 +3440,7 @@ def main():
                     st.markdown(f"""
                     <div style="padding: 20px; background: linear-gradient(135deg, #F8FAFB 0%, #E8F4F8 100%); border-radius: 12px; border: 2px solid #4A90A4;">
                         <h4 style="color: #2E5266; margin-bottom: 15px;">📦 {selected_asin} の原価計算内訳</h4>
-                        <p style="color: #6B7280; font-size: 14px; margin-bottom: 20px;">
+                        <p style="color: #6B7280; font-size: 11px; margin-bottom: 20px;">
                             <strong>商品名:</strong> {selected_row.get('商品名', 'N/A')}<br>
                             <strong>数量:</strong> {qty:,.0f}個
                         </p>
@@ -3270,10 +3494,10 @@ def main():
                         with col:
                             col.markdown(f"""
                             <div style="padding: 15px; background-color: #E8F4F8; border-left: 4px solid #4A90A4; border-radius: 8px; height: 180px;">
-                                <div style="font-size: 24px; text-align: center; margin-bottom: 8px;">{comp['icon']}</div>
-                                <div style="font-size: 11px; color: #6B7280; font-weight: 600; text-align: center; margin-bottom: 8px;">{comp['title']}</div>
-                                <div style="font-size: 18px; color: #2E5266; font-weight: 700; text-align: center; margin-bottom: 8px;">¥{comp['value_jpy']:,.2f}</div>
-                                <div style="font-size: 9px; color: #6B7280; text-align: center; line-height: 1.4;">{comp['formula']}</div>
+                                <div style="font-size: 18px; text-align: center; margin-bottom: 8px;">{comp['icon']}</div>
+                                <div style="font-size: 9px; color: #6B7280; font-weight: 600; text-align: center; margin-bottom: 8px;">{comp['title']}</div>
+                                <div style="font-size: 14px; color: #2E5266; font-weight: 700; text-align: center; margin-bottom: 8px;">¥{comp['value_jpy']:,.2f}</div>
+                                <div style="font-size: 8px; color: #6B7280; text-align: center; line-height: 1.4;">{comp['formula']}</div>
                             </div>
                             """, unsafe_allow_html=True)
                     
@@ -3294,8 +3518,8 @@ def main():
                     with col1:
                         st.markdown(f"""
                         <div style="padding: 20px; background-color: #FFF; border-radius: 8px; border: 2px solid #E5E7EB;">
-                            <div style="font-size: 14px; color: #6B7280; margin-bottom: 10px;">計算式:</div>
-                            <div style="font-size: 12px; color: #2E5266; line-height: 2;">
+                            <div style="font-size: 11px; color: #6B7280; margin-bottom: 10px;">計算式:</div>
+                            <div style="font-size: 10px; color: #2E5266; line-height: 2;">
                                 ¥{unit_price_jpy:,.2f}<br>
                                 + ¥{domestic_shipping_per_item_jpy:,.2f}<br>
                                 + ¥{option_fee_jpy:,.2f}<br>
@@ -3308,7 +3532,7 @@ def main():
                     with col2:
                         st.markdown("""
                         <div style="text-align: center; padding-top: 60px;">
-                            <div style="font-size: 32px; color: #4A90A4;">=</div>
+                            <div style="font-size: 24px; color: #4A90A4;">=</div>
                         </div>
                         """, unsafe_allow_html=True)
                     
@@ -3319,11 +3543,11 @@ def main():
                         
                         st.markdown(f"""
                         <div style="padding: 20px; background: linear-gradient(135deg, #D1E7F0 0%, #B8DAE8 100%); border-radius: 8px; border: 3px solid #2E5266;">
-                            <div style="font-size: 14px; color: #2E5266; font-weight: 600; margin-bottom: 5px;">計算結果</div>
-                            <div style="font-size: 28px; color: #1F2937; font-weight: 700; margin-bottom: 10px;">¥{calculated_cost:,.2f}</div>
-                            <div style="font-size: 12px; color: #6B7280; margin-bottom: 5px;">表の原価: ¥{actual_cost:,.2f}</div>
-                            <div style="font-size: 13px; color: {match_color}; font-weight: 600;">{match_status}</div>
-                            {f'<div style="font-size: 11px; color: #6B7280;">差分: ¥{difference:,.2f}</div>' if abs(difference) >= 0.01 else ''}
+                            <div style="font-size: 11px; color: #2E5266; font-weight: 600; margin-bottom: 5px;">計算結果</div>
+                            <div style="font-size: 21px; color: #1F2937; font-weight: 700; margin-bottom: 10px;">¥{calculated_cost:,.2f}</div>
+                            <div style="font-size: 10px; color: #6B7280; margin-bottom: 5px;">表の原価: ¥{actual_cost:,.2f}</div>
+                            <div style="font-size: 11px; color: {match_color}; font-weight: 600;">{match_status}</div>
+                            {f'<div style="font-size: 9px; color: #6B7280;">差分: ¥{difference:,.2f}</div>' if abs(difference) >= 0.01 else ''}
                         </div>
                         """, unsafe_allow_html=True)
             
