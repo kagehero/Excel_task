@@ -2646,8 +2646,8 @@ def main():
                         styled_jancode = detail_df.style.apply(highlight_jancode_dimensions, axis=None)
                         format_dict = {}
                         for col in detail_df.columns:
-                            if 'cm' in col or '寸法' in col:
-                                format_dict[col] = '{:,.2f}'
+                            if 'cm' in col or '寸法' in col or '体積' in col:
+                                format_dict[col] = '{:,.1f}'
                         styled_jancode = styled_jancode.format(format_dict, na_rep='-')
                         
                         st.dataframe(styled_jancode, width='stretch', height=250)
@@ -3376,6 +3376,8 @@ def main():
                     format_dict[col] = '{:,.2f}'
                 elif col == '数量':
                     format_dict[col] = '{:,.0f}'
+                elif 'cm' in col or '寸法' in col or '体積' in col:
+                    format_dict[col] = '{:,.1f}'
             
             styled_df = styled_df.format(format_dict, na_rep='-')
             
