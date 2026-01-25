@@ -17,6 +17,7 @@ import re
 from typing import Dict, List, Optional, Tuple
 from io import BytesIO, StringIO
 import PyPDF2
+import zipfile
 try:
     import pdfplumber
     PDFPLUMBER_AVAILABLE = True
@@ -161,6 +162,86 @@ def save_uploaded_file(uploaded_file, file_type: str):
             f.write(uploaded_file.getbuffer())
         
         return str(file_path)
+    return None
+
+
+def extract_zip_file(zip_file) -> List[Path]:
+    """ZIPファイルを展開してファイルリストを返す"""
+    temp_dir = Path(tempfile.gettempdir()) / "fba_processor" / "extracted"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    
+    extracted_files = []
+    try:
+        with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+            # ZIP内のファイルを展開
+            zip_ref.extractall(temp_dir)
+            
+            # 展開されたファイルのパスを取得
+            for file_path in temp_dir.rglob('*'):
+                if file_path.is_file():
+                    extracted_files.append(file_path)
+    except Exception as e:
+        st.error(f"ZIPファイルの展開エラー: {str(e)}")
+        return []
+    
+    return extracted_files
+
+
+def detect_file_type(filename: str) -> Optional[str]:
+    """
+    ファイル名からファイルタイプを自動判別
+    
+    厳密な判別ルール（ルールに該当するファイルのみ処理）:
+    - FBA指示書: ファイル名に「FBA指示書」を必ず含む（.xls / .xlsx）
+      ※英語文字（FBA）は大文字・小文字を区別しない（FBA、fba、Fbaなどすべて認識）
+    - send-order-list: ファイル名に「send-order-list」を必ず含む（.xls / .xlsx）
+      ※英語文字は大文字・小文字を区別しない（Send-Order-List、SEND-ORDER-LISTなどすべて認識）
+    - record-list: ファイル名に「record-list」を必ず含む（.xls / .xlsx）
+      ※英語文字は大文字・小文字を区別しない（Record-List、RECORD-LISTなどすべて認識）
+    - jancode-list: ファイル名に「jancode-list」を必ず含む（.xlsx）
+      ※英語文字は大文字・小文字を区別しない（Jancode-List、JANCODE-LISTなどすべて認識）
+    - 輸入許可通知書: PDFファイルはすべて「輸入許可通知書」として認識
+    - メールのテキスト: ファイル名に「配送依頼No.」を必ず含む（.txt）
+      ※英語文字（No）は大文字・小文字を区別しない（NO、no、Noなどすべて認識）
+    
+    ルールに該当しないファイルは None を返す（警告なしでスキップ）
+    """
+    # ファイル名を小文字に変換して大文字・小文字を区別しない判定を行う
+    filename_lower = filename.lower()
+    
+    # 拡張子を取得（小文字に変換）
+    ext = Path(filename).suffix.lower()
+    
+    # PDFファイルはすべて輸入許可通知書
+    if ext == '.pdf':
+        return 'import_permit'
+    
+    # テキストファイルで「配送依頼No」を含む場合はメール情報
+    # 「配送依頼No.」「配送依頼No***」「配送依頼no.」「配送依頼NO」などすべて認識
+    # ファイル名に「配送依頼No」が含まれていれば、ピリオドの有無に関わらず認識
+    if ext == '.txt' and '配送依頼no' in filename_lower:
+        return 'email_text'
+    
+    # Excelファイルの判別（厳密にルールに従う、大文字・小文字を区別しない）
+    if ext in ['.xls', '.xlsx']:
+        # FBA指示書: ファイル名に「FBA指示書」を必ず含む
+        # 「FBA指示書」「fba指示書」「Fba指示書」などすべて認識
+        if 'fba指示書' in filename_lower:
+            return 'fba'
+        # send-order-list: ファイル名に「send-order-list」を必ず含む
+        # 「send-order-list」「Send-Order-List」「SEND-ORDER-LIST」などすべて認識
+        elif 'send-order-list' in filename_lower:
+            return 'send_order'
+        # record-list: ファイル名に「record-list」を必ず含む
+        # 「record-list」「Record-List」「RECORD-LIST」などすべて認識
+        elif 'record-list' in filename_lower:
+            return 'record_list'
+        # jancode-list: ファイル名に「jancode-list」を必ず含む（.xlsxのみ）
+        # 「jancode-list」「Jancode-List」「JANCODE-LIST」などすべて認識
+        elif ext == '.xlsx' and 'jancode-list' in filename_lower:
+            return 'jancode'
+    
+    # ルールに該当しないファイルは None を返す（警告なしでスキップ）
     return None
 
 
@@ -342,6 +423,222 @@ def promote_header_row(df: pd.DataFrame, keywords: List[str]) -> pd.DataFrame:
             new_df = new_df.loc[:, new_df.columns.notna()]
             return new_df.reset_index(drop=True)
     return df
+
+
+def parse_email_text_file(file_path: str) -> Dict[str, Dict]:
+    """
+    メール本文のテキストファイルを解析してメール情報を抽出
+    複数の配送依頼No.に対応
+    
+    想定フォーマット:
+    配送依頼No.663094
+    国際送料：1820.00 元
+    オプション料金：1589.50 元
+    通関手数料：4.00 元
+    中国国内送料：527.70 元
+    合計金額：3941.20 元
+    
+    配送依頼No.663095
+    国際送料：...
+    ...
+    """
+    email_data = {}
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # デバッグ: ファイル内容を表示
+        print(f"\n=== メールテキストファイル解析 ===")
+        print(f"ファイルパス: {file_path}")
+        print(f"ファイル内容（最初の1000文字）:\n{content[:1000]}")
+        
+        # 配送依頼No.をすべて抽出（より柔軟なパターン）
+        shipping_request_patterns = [
+            r'配送依頼No\.?\s*[:：]?\s*(\d+)',
+            r'配送依頼\s*No\.?\s*[:：]?\s*(\d+)',
+            r'配送依頼番号[:：]?\s*(\d+)',
+        ]
+        
+        # すべての配送依頼No.を検出
+        shipping_request_nos = []
+        for pattern in shipping_request_patterns:
+            matches = re.finditer(pattern, content)
+            for match in matches:
+                shipping_no = match.group(1)
+                if shipping_no not in shipping_request_nos:
+                    shipping_request_nos.append(shipping_no)
+            if shipping_request_nos:
+                break
+        
+        if not shipping_request_nos:
+            print("⚠️ 配送依頼No.が見つかりませんでした")
+            return {}
+        
+        print(f"検出された配送依頼No.: {shipping_request_nos}")
+        
+        # 各項目を抽出するパターン（より柔軟なパターン）
+        # 数値の前に記号（①、②、③など）がある場合にも対応
+        patterns = {
+            '国際送料': [
+                # 記号（①など）を無視するパターン（最優先）
+                r'国際送料[：:]\s*[①-⑳⓪]*\s*([\d,]+\.?\d*)\s*元',
+                r'国際送料\s*[：:]\s*[①-⑳⓪]*\s*([\d,]+\.?\d*)\s*元',
+                r'国際送料[:：]\s*[①-⑳⓪]*\s*([\d,]+\.?\d*)',
+                # 記号なしのパターン（フォールバック）
+                r'国際送料[：:]\s*([\d,]+\.?\d*)\s*元',
+                r'国際送料\s*[：:]\s*([\d,]+\.?\d*)\s*元',
+                r'国際送料[:：]\s*([\d,]+\.?\d*)',
+                r'国際送料費[：:]\s*[①-⑳⓪]*\s*([\d,]+\.?\d*)\s*元',
+                r'国際送料[（(]元[）)]\s*[：:]\s*[①-⑳⓪]*\s*([\d,]+\.?\d*)',
+                # より柔軟なパターン：任意の記号を無視
+                r'国際送料[：:\s]*[^\d]*([\d,]+\.?\d*)\s*元?',
+            ],
+            'オプション料金': [
+                r'オプション料金[：:]\s*[①-⑳⓪]*\s*([\d,]+\.?\d*)\s*元',
+                r'オプション料金\s*[：:]\s*[①-⑳⓪]*\s*([\d,]+\.?\d*)\s*元',
+                r'オプション料金[:：]\s*[①-⑳⓪]*\s*([\d,]+\.?\d*)',
+                r'オプション料金[：:]\s*([\d,]+\.?\d*)\s*元',
+                r'オプション料金\s*[：:]\s*([\d,]+\.?\d*)\s*元',
+                r'オプション料金[:：]\s*([\d,]+\.?\d*)',
+            ],
+            '通関手数料': [
+                r'通関手数料[：:]\s*[①-⑳⓪]*\s*([\d,]+\.?\d*)\s*元',
+                r'通関手数料\s*[：:]\s*[①-⑳⓪]*\s*([\d,]+\.?\d*)\s*元',
+                r'通関手数料[:：]\s*[①-⑳⓪]*\s*([\d,]+\.?\d*)',
+                r'通関手数料[：:]\s*([\d,]+\.?\d*)\s*元',
+                r'通関手数料\s*[：:]\s*([\d,]+\.?\d*)\s*元',
+                r'通関手数料[:：]\s*([\d,]+\.?\d*)',
+            ],
+            '中国国内送料': [
+                r'中国国内送料[：:]\s*[①-⑳⓪]*\s*([\d,]+\.?\d*)\s*元',
+                r'中国国内送料\s*[：:]\s*[①-⑳⓪]*\s*([\d,]+\.?\d*)\s*元',
+                r'中国国内送料[:：]\s*[①-⑳⓪]*\s*([\d,]+\.?\d*)',
+                r'中国国内送料[：:]\s*([\d,]+\.?\d*)\s*元',
+                r'中国国内送料\s*[：:]\s*([\d,]+\.?\d*)\s*元',
+                r'中国国内送料[:：]\s*([\d,]+\.?\d*)',
+            ],
+        }
+        
+        # オプション内訳項目のパターン（別途処理）
+        option_detail_patterns = {
+            '特殊検品': [
+                r'特殊検品[=＝]\s*([\d,]+\.?\d*)\s*元',
+                r'特殊検品[：:]\s*([\d,]+\.?\d*)\s*元',
+                r'特殊検品\s*[=＝:：]\s*([\d,]+\.?\d*)',
+            ],
+            '全開封検査': [
+                r'全開封検査[=＝]\s*([\d,]+\.?\d*)\s*元',
+                r'全開封検査[：:]\s*([\d,]+\.?\d*)\s*元',
+                r'全開封検査\s*[=＝:：]\s*([\d,]+\.?\d*)',
+            ],
+            '撮影': [
+                r'撮影[=＝]\s*([\d,]+\.?\d*)\s*元',
+                r'撮影[：:]\s*([\d,]+\.?\d*)\s*元',
+                r'撮影\s*[=＝:：]\s*([\d,]+\.?\d*)',
+            ],
+            'その他オプション': [
+                r'その他[=＝]\s*([\d,]+\.?\d*)\s*元',
+                r'その他オプション[=＝]\s*([\d,]+\.?\d*)\s*元',
+                r'その他[：:]\s*([\d,]+\.?\d*)\s*元',
+                r'その他オプション[：:]\s*([\d,]+\.?\d*)\s*元',
+            ],
+        }
+        
+        # 各配送依頼No.ごとに情報を抽出
+        for idx, shipping_request_no in enumerate(shipping_request_nos):
+            print(f"\n--- 配送依頼No. {shipping_request_no} の情報を抽出中 ---")
+            
+            # この配送依頼No.のセクションを抽出
+            # 次の配送依頼No.までの範囲、または最後まで
+            if idx < len(shipping_request_nos) - 1:
+                # 次の配送依頼No.までの範囲
+                next_shipping_no = shipping_request_nos[idx + 1]
+                pattern_current = rf'配送依頼No\.?\s*[:：]?\s*{shipping_request_no}'
+                pattern_next = rf'配送依頼No\.?\s*[:：]?\s*{next_shipping_no}'
+                match_current = re.search(pattern_current, content)
+                match_next = re.search(pattern_next, content)
+                if match_current and match_next:
+                    section_content = content[match_current.start():match_next.start()]
+                else:
+                    # フォールバック: 最初の配送依頼No.から次の配送依頼No.まで
+                    section_content = content
+            else:
+                # 最後の配送依頼No.の場合、最後まで
+                pattern_current = rf'配送依頼No\.?\s*[:：]?\s*{shipping_request_no}'
+                match_current = re.search(pattern_current, content)
+                if match_current:
+                    section_content = content[match_current.start():]
+                else:
+                    section_content = content
+            
+            # このセクションから各項目を抽出
+            parsed_data = {}
+            
+            # まず基本項目を抽出
+            for key, pattern_list in patterns.items():
+                # オプション内訳項目は後で処理
+                if key in ['特殊検品', '全開封検査', '撮影', 'その他オプション']:
+                    continue
+                    
+                value = None
+                for pattern in pattern_list:
+                    match = re.search(pattern, section_content)
+                    if match:
+                        # カンマを除去して数値に変換
+                        value_str = match.group(1).replace(',', '').strip()
+                        try:
+                            value = float(value_str)
+                            print(f"✓ {key}: {value} (パターン: {pattern})")
+                            break
+                        except ValueError:
+                            print(f"⚠️ {key}: 数値変換エラー '{value_str}'")
+                            continue
+                
+                if value is not None:
+                    parsed_data[key] = value
+                else:
+                    parsed_data[key] = 0.0
+                    print(f"⚠️ {key}: 見つかりませんでした")
+                    # デバッグ: 該当する行を探す
+                    lines = section_content.split('\n')
+                    for i, line in enumerate(lines):
+                        if key in line:
+                            print(f"  候補行 {i+1}: {line.strip()}")
+            
+            # オプション内訳項目を抽出（括弧内やカンマ区切りに対応）
+            for key, pattern_list in option_detail_patterns.items():
+                value = None
+                for pattern in pattern_list:
+                    match = re.search(pattern, section_content)
+                    if match:
+                        # カンマを除去して数値に変換
+                        value_str = match.group(1).replace(',', '').strip()
+                        try:
+                            value = float(value_str)
+                            print(f"✓ {key}: {value} (パターン: {pattern})")
+                            parsed_data[key] = value
+                            break
+                        except ValueError:
+                            print(f"⚠️ {key}: 数値変換エラー '{value_str}'")
+                            continue
+            
+            email_data[shipping_request_no] = parsed_data
+            print(f"解析結果: {parsed_data}")
+        
+        print(f"\n=== 全配送依頼No.の解析完了 ===")
+        print(f"取得した配送依頼No.数: {len(email_data)}")
+        for shipping_no, data in email_data.items():
+            print(f"  配送依頼No. {shipping_no}: {data}")
+        print("=" * 50)
+        
+    except Exception as e:
+        print(f"❌ メールテキストファイル解析エラー: {e}")
+        import traceback
+        traceback.print_exc()
+        return {}
+    
+    return email_data
 
 
 def _build_asin_subset(file_path: str, asin_candidates: List[str], target_groups: List[List[str]], asins: List[str]) -> pd.DataFrame:
@@ -606,15 +903,22 @@ def get_instruction_summary(file_path: str) -> pd.DataFrame:
             order_nos_raw = df[order_no_col].dropna().astype(str).tolist()
             log_print(f"\n注文番号列（groupby前・promote_header_row後）から {len(order_nos_raw)}件のデータを取得")
             
-            # カンマ区切りの場合も考慮
+            # カンマ区切り、改行区切り、その他の区切り文字を考慮
+            import re
             for order_no in order_nos_raw:
                 order_str = str(order_no).strip()
                 if not order_str or order_str == 'nan' or order_str == '':
                     continue
-                if ',' in order_str:
-                    instruction_order_numbers.extend([o.strip() for o in order_str.split(',')])
-                else:
-                    instruction_order_numbers.append(order_str)
+                
+                # 複数の区切り文字で分割（カンマ、改行、セミコロン、タブ、連続スペースなど）
+                # 改行文字（\n、\r\n、\r）、カンマ、セミコロン、タブ、連続スペースで分割
+                separators = r'[,;\t\n\r]+|\s{2,}'
+                order_parts = re.split(separators, order_str)
+                
+                for part in order_parts:
+                    part_clean = part.strip()
+                    if part_clean and part_clean.lower() != 'nan' and len(part_clean) > 0:
+                        instruction_order_numbers.append(part_clean)
             
             # 空文字列とnanを除外
             instruction_order_numbers = [o for o in instruction_order_numbers if o and o != 'nan' and o != '']
@@ -627,15 +931,22 @@ def get_instruction_summary(file_path: str) -> pd.DataFrame:
             order_nos_raw = summary['注文番号_temp'].dropna().astype(str).tolist()
             log_print(f"\n注文番号列（groupby前・summaryから）から {len(order_nos_raw)}件のデータを取得")
             
-            # カンマ区切りの場合も考慮
+            # カンマ区切り、改行区切り、その他の区切り文字を考慮
+            import re
             for order_no in order_nos_raw:
                 order_str = str(order_no).strip()
                 if not order_str or order_str == 'nan' or order_str == '':
                     continue
-                if ',' in order_str:
-                    instruction_order_numbers.extend([o.strip() for o in order_str.split(',')])
-                else:
-                    instruction_order_numbers.append(order_str)
+                
+                # 複数の区切り文字で分割（カンマ、改行、セミコロン、タブ、連続スペースなど）
+                # 改行文字（\n、\r\n、\r）、カンマ、セミコロン、タブ、連続スペースで分割
+                separators = r'[,;\t\n\r]+|\s{2,}'
+                order_parts = re.split(separators, order_str)
+                
+                for part in order_parts:
+                    part_clean = part.strip()
+                    if part_clean and part_clean.lower() != 'nan' and len(part_clean) > 0:
+                        instruction_order_numbers.append(part_clean)
             
             # 空文字列とnanを除外
             instruction_order_numbers = [o for o in instruction_order_numbers if o and o != 'nan' and o != '']
@@ -1191,6 +1502,59 @@ def extract_order_id_from_text(cell: str) -> str:
     return ''
 
 
+def extract_num_and_price_from_text(cell: str) -> dict:
+    """オーダーIDを含むテキストからnum（数量）とprice（価格）を抽出
+    
+    例: オーダーID：5289357、num：15、price：3.2
+    """
+    result = {'num': None, 'price': None}
+    
+    if pd.isna(cell) or cell == '':
+        return result
+    
+    text = str(cell)
+    
+    # num（数量）の抽出パターン
+    num_patterns = [
+        r'num\s*[:：]\s*([0-9]+\.?[0-9]*)',      # num：15
+        r'num[:：]\s*([0-9]+\.?[0-9]*)',         # num:15
+        r'num\s*[=＝]\s*([0-9]+\.?[0-9]*)',      # num=15
+        r'数量\s*[:：]\s*([0-9]+\.?[0-9]*)',     # 数量：15
+        r'数量[:：]\s*([0-9]+\.?[0-9]*)',        # 数量:15
+        r'数量\s*[=＝]\s*([0-9]+\.?[0-9]*)',     # 数量=15
+    ]
+    
+    for pat in num_patterns:
+        match = re.search(pat, text, re.IGNORECASE)
+        if match:
+            try:
+                result['num'] = float(match.group(1))
+                break
+            except (ValueError, AttributeError):
+                continue
+    
+    # price（価格）の抽出パターン
+    price_patterns = [
+        r'price\s*[:：]\s*([0-9]+\.?[0-9]*)',    # price：3.2
+        r'price[:：]\s*([0-9]+\.?[0-9]*)',       # price:3.2
+        r'price\s*[=＝]\s*([0-9]+\.?[0-9]*)',    # price=3.2
+        r'価格\s*[:：]\s*([0-9]+\.?[0-9]*)',     # 価格：3.2
+        r'価格[:：]\s*([0-9]+\.?[0-9]*)',        # 価格:3.2
+        r'価格\s*[=＝]\s*([0-9]+\.?[0-9]*)',     # 価格=3.2
+    ]
+    
+    for pat in price_patterns:
+        match = re.search(pat, text, re.IGNORECASE)
+        if match:
+            try:
+                result['price'] = float(match.group(1))
+                break
+            except (ValueError, AttributeError):
+                continue
+    
+    return result
+
+
 def _find_price_columns(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
     """
     金額列（CNY）と参考金額列（JPY）を検出
@@ -1464,6 +1828,9 @@ def get_record_list_preview(order_numbers: List[str], file_path: str, asin_order
         
         # オーダーIDを含む列を特定（detail_colを優先、なければorder_col）
         order_id_source_col = None
+        has_product_purchase = False  # 「商品購入」列の存在フラグ
+        operation_type_col = None  # 操作種類列（-1列目）
+        
         if detail_col and detail_col in all_cols:
             order_id_source_col = detail_col
             debug_info['order_id_source_col'] = f"使用状況の詳細列: {detail_col}"
@@ -1477,27 +1844,58 @@ def get_record_list_preview(order_numbers: List[str], file_path: str, asin_order
                 source_col_idx = all_cols.index(order_id_source_col)
                 debug_info['order_id_source_col_index'] = source_col_idx
                 
-                # オーダーIDを含む列の次の列（+1）が金額(CNY)
-                if source_col_idx + 1 < len(all_cols):
-                    cny_col = all_cols[source_col_idx + 1]
-                    debug_info['cny_col_detection_method'] = f"位置関係（オーダーID列の次の列、インデックス{source_col_idx + 1}）"
-                    debug_info['cny_col_index'] = source_col_idx + 1
+                # オーダーIDを含む列の-1列（前の列）を確認
+                if source_col_idx - 1 >= 0:
+                    operation_type_col = all_cols[source_col_idx - 1]
+                    debug_info['operation_type_col'] = f"操作種類列（-1列目、インデックス{source_col_idx - 1}）: {operation_type_col}"
+                    
+                    # サンプル値を確認（「商品購入」が含まれているか）
+                    if not df[operation_type_col].empty:
+                        sample_values = df[operation_type_col].dropna().head(5).tolist()
+                        debug_info['operation_type_samples'] = sample_values
+                        
+                        # 「商品購入」が含まれているか確認
+                        has_product_purchase = any('商品購入' in str(val) for val in sample_values)
+                        debug_info['has_product_purchase'] = has_product_purchase
+                        
+                        if has_product_purchase:
+                            # 「商品購入」の場合のみ、オーダーID列の次の列（+1）が金額(CNY)
+                            if source_col_idx + 1 < len(all_cols):
+                                cny_col = all_cols[source_col_idx + 1]
+                                debug_info['cny_col_detection_method'] = f"位置関係（商品購入の場合、オーダーID列の次の列、インデックス{source_col_idx + 1}）"
+                                debug_info['cny_col_index'] = source_col_idx + 1
+                            else:
+                                debug_info['cny_col_detection_error'] = f"オーダーID列の次の列が存在しません（インデックス{source_col_idx + 1}）"
+                            
+                            # オーダーID列の次の次の列（+2）が参考金額(JPY)
+                            if source_col_idx + 2 < len(all_cols):
+                                jpy_col = all_cols[source_col_idx + 2]
+                                debug_info['jpy_col_detection_method'] = f"位置関係（商品購入の場合、オーダーID列の+2列目、インデックス{source_col_idx + 2}）"
+                                debug_info['jpy_col_index'] = source_col_idx + 2
+                            else:
+                                debug_info['jpy_col_detection_error'] = f"オーダーID列の+2列目が存在しません（インデックス{source_col_idx + 2}）"
+                        else:
+                            debug_info['operation_type_note'] = "操作種類列に「商品購入」が含まれていません。金額列は抽出しません。"
+                            # 「商品購入」がない場合は金額列を検出しない
+                            cny_col = None
+                            jpy_col = None
+                    else:
+                        debug_info['operation_type_col_empty'] = "操作種類列が空です。金額列は抽出しません。"
+                        # 操作種類列が空の場合は金額列を検出しない
+                        cny_col = None
+                        jpy_col = None
                 else:
-                    debug_info['cny_col_detection_error'] = f"オーダーID列の次の列が存在しません（インデックス{source_col_idx + 1}）"
-                
-                # オーダーIDを含む列の次の次の列（+2）が参考金額(JPY)
-                if source_col_idx + 2 < len(all_cols):
-                    jpy_col = all_cols[source_col_idx + 2]
-                    debug_info['jpy_col_detection_method'] = f"位置関係（オーダーID列の+2列目、インデックス{source_col_idx + 2}）"
-                    debug_info['jpy_col_index'] = source_col_idx + 2
-                else:
-                    debug_info['jpy_col_detection_error'] = f"オーダーID列の+2列目が存在しません（インデックス{source_col_idx + 2}）"
+                    debug_info['operation_type_col_not_found'] = "オーダーID列の前の列が存在しません。金額列は抽出しません。"
+                    # -1列が存在しない場合は金額列を検出しない
+                    cny_col = None
+                    jpy_col = None
                 
             except (ValueError, IndexError) as e:
                 debug_info['position_based_detection_error'] = str(e)
         
-        # 位置関係で見つからない場合、列名ベースの検出を試みる
-        if not cny_col or not jpy_col:
+        # 「商品購入」列が検出された場合のみ、位置関係で見つからない場合に列名ベースの検出を試みる
+        # 「商品購入」列がない場合は、金額列を検出しない（既にcny_colとjpy_colはNone）
+        if (cny_col is None or jpy_col is None) and has_product_purchase:
             cny_col_fallback, jpy_col_fallback = _find_price_columns(df)
             if not cny_col:
                 cny_col = cny_col_fallback
@@ -1625,6 +2023,36 @@ def get_record_list_preview(order_numbers: List[str], file_path: str, asin_order
         mask = df_order_str.isin(expanded_orders_str)
         subset = df[mask].copy()
         
+        # 「商品購入」列がある場合のみ、その列でフィルタリング
+        if operation_type_col and operation_type_col in subset.columns:
+            # 「商品購入」が含まれる行のみを保持
+            product_purchase_mask = subset[operation_type_col].astype(str).str.contains('商品購入', na=False)
+            before_filter_count = len(subset)
+            subset = subset[product_purchase_mask].copy()
+            after_filter_count = len(subset)
+            debug_info['filtered_by_product_purchase'] = True
+            debug_info['rows_before_product_purchase_filter'] = int(before_filter_count)
+            debug_info['rows_after_product_purchase_filter'] = int(after_filter_count)
+            if before_filter_count != after_filter_count:
+                debug_info['product_purchase_filter_removed'] = int(before_filter_count - after_filter_count)
+        else:
+            debug_info['filtered_by_product_purchase'] = False
+            if not operation_type_col:
+                debug_info['no_operation_type_col_for_filtering'] = "操作種類列が見つからないため、フィルタリングしません"
+        
+        # 注文番号で重複を除去（同じ注文番号が複数ある場合、最初の1件のみを保持）
+        if not subset.empty and order_col in subset.columns:
+            before_dedup_count = len(subset)
+            subset = subset.drop_duplicates(subset=[order_col], keep='first')
+            after_dedup_count = len(subset)
+            if before_dedup_count != after_dedup_count:
+                debug_info['duplicate_removed'] = True
+                debug_info['duplicate_removed_count'] = int(before_dedup_count - after_dedup_count)
+                debug_info['rows_before_dedup'] = int(before_dedup_count)
+                debug_info['rows_after_dedup'] = int(after_dedup_count)
+            else:
+                debug_info['duplicate_removed'] = False
+        
         # 見つかった注文番号を記録
         found_orders = set(subset[order_col].astype(str).str.strip().unique())
         found_orders.discard('')  # 空文字を除外
@@ -1684,12 +2112,52 @@ def get_record_list_preview(order_numbers: List[str], file_path: str, asin_order
             if amt_col in subset.columns:
                 subset[amt_col] = pd.to_numeric(subset[amt_col], errors='coerce')
         
+        # オーダーID列からnum（数量）とprice（価格）を抽出
+        # detail_col（使用状況の詳細列）が存在する場合、その列から抽出
+        # num/priceの情報は通常「使用状況の詳細」列に含まれている
+        if detail_col and detail_col in df.columns:
+            # 元のDataFrameから該当行を取得（フィルタリング前のデータ）
+            original_subset = df[mask].copy()
+            
+            # numとpriceを抽出
+            num_price_data = original_subset[detail_col].apply(extract_num_and_price_from_text)
+            
+            # 抽出結果をDataFrameに追加
+            subset['数量（num）'] = num_price_data.apply(lambda x: x.get('num'))
+            subset['価格（price）'] = num_price_data.apply(lambda x: x.get('price'))
+            
+            # デバッグ情報に追加
+            num_extracted_count = subset['数量（num）'].notna().sum()
+            price_extracted_count = subset['価格（price）'].notna().sum()
+            debug_info['num_extracted_count'] = int(num_extracted_count)
+            debug_info['price_extracted_count'] = int(price_extracted_count)
+            debug_info['num_price_source_col'] = detail_col
+            
+            # サンプルを保存
+            if num_extracted_count > 0:
+                sample_num = subset[subset['数量（num）'].notna()]['数量（num）'].head(3).tolist()
+                debug_info['num_samples'] = sample_num
+            if price_extracted_count > 0:
+                sample_price = subset[subset['価格（price）'].notna()]['価格（price）'].head(3).tolist()
+                debug_info['price_samples'] = sample_price
+            
+            # 抽出元のテキストサンプルも保存（デバッグ用）
+            if num_extracted_count > 0 or price_extracted_count > 0:
+                sample_texts = original_subset[detail_col].dropna().head(3).tolist()
+                debug_info['num_price_source_texts'] = [str(t)[:200] for t in sample_texts]  # 最初の200文字
+        else:
+            debug_info['num_price_extraction_skipped'] = f"detail_colが見つかりませんでした（detail_col: {detail_col}）"
+        
         # 列順を確定
         final_cols = ['注文番号']
         if '金額（CNY）' in subset.columns:
             final_cols.append('金額（CNY）')
         if '参考金額（JPY）' in subset.columns:
             final_cols.append('参考金額（JPY）')
+        if '数量（num）' in subset.columns:
+            final_cols.append('数量（num）')
+        if '価格（price）' in subset.columns:
+            final_cols.append('価格（price）')
         
         return subset[final_cols].reset_index(drop=True)
         
@@ -1843,6 +2311,19 @@ def process_data_from_previews(
     # メールデータから配送依頼No.に対応する情報を取得
     email_info = email_data.get(shipping_request_no, {}) if shipping_request_no else {}
     
+    # デバッグ: メールデータの確認
+    print(f"\n=== メールデータ確認 ===")
+    print(f"配送依頼No.: {shipping_request_no}")
+    print(f"email_data keys: {list(email_data.keys())}")
+    print(f"email_data内容: {email_data}")
+    print(f"email_info: {email_info}")
+    if email_info:
+        print(f"email_info keys: {list(email_info.keys())}")
+        print(f"国際送料 in email_info: {'国際送料' in email_info}")
+        if '国際送料' in email_info:
+            print(f"国際送料の値: {email_info['国際送料']}")
+    print("=" * 50)
+    
     # 第1パス: 各商品の体積を計算し、総体積を求める
     product_volumes = {}  # {ASIN: 体積}
     total_volume = 0.0
@@ -1885,11 +2366,19 @@ def process_data_from_previews(
     
     # 国際送料の取得
     international_shipping_cny = 0
+    print(f"\n=== 国際送料の取得 ===")
+    print(f"email_info: {email_info}")
+    print(f"'国際送料' in email_info: {'国際送料' in email_info}")
     if email_info and '国際送料' in email_info:
         international_shipping_cny = email_info['国際送料']
+        print(f"✓ 国際送料を取得: {international_shipping_cny} 元")
     else:
+        print(f"⚠️ 国際送料が見つかりません")
         if shipping_request_no:
             errors.append(f"⚠️ 配送依頼No. {shipping_request_no} の国際送料がメールデータに入力されていません")
+            print(f"  配送依頼No. {shipping_request_no} がemail_dataに存在するか: {shipping_request_no in email_data}")
+            if shipping_request_no in email_data:
+                print(f"  email_data[{shipping_request_no}]: {email_data[shipping_request_no]}")
     
     international_shipping_jpy = international_shipping_cny * cny_to_jpy_rate
     
@@ -2065,8 +2554,9 @@ def process_data_from_previews(
         base_option_fee_per_item_jpy = base_option_fee_jpy / qty if qty > 0 else 0
         print(f"基本オプション費用（1個あたり・円）: {base_option_fee_per_item_jpy}")
         
-        # 2. メールのオプション料金で検算（合計値と比較）
+        # 2. メールのオプション料金で検算（合計値と比較）と差額の計算
         # 注意：この検算は最初のASINの処理時のみ実行
+        option_difference_cny = 0
         if email_info and 'オプション料金' in email_info and asin == fba_df.iloc[0]['ASIN']:
             email_option_total_cny = email_info.get('オプション料金', 0) or 0
             instruction_option_total_cny = fba_df['オプション費用（元）'].sum() if 'オプション費用（元）' in fba_df.columns else 0
@@ -2079,31 +2569,69 @@ def process_data_from_previews(
                 print(f"fba_dfのオプション費用詳細:")
                 print(fba_df[['ASIN', '数量', 'オプション費用（元）']].to_string())
             
-            difference = email_option_total_cny - instruction_option_total_cny
-            if abs(difference) > 0.01:
-                print(f"⚠️ 差分あり: {difference}元")
+            option_difference_cny = email_option_total_cny - instruction_option_total_cny
+            if abs(option_difference_cny) > 0.01:
+                print(f"⚠️ 差分あり: {option_difference_cny}元")
                 print(f"   この差分は追加オプション費用配分で処理してください")
             else:
                 print(f"✓ メールと指示書のオプション費用が一致しています")
         
         # 3. 追加オプション費用配分（特定のASINに追加）
         additional_option_fee_jpy = 0
+        
+        # 3-1. 手動分配情報がある場合はそれを使用
         if option_distribution and shipping_request_no in option_distribution:
             distributions = option_distribution[shipping_request_no]
             for dist in distributions:
-                if asin in dist['ASINs']:
-                    # この配分がこのASINに適用される
-                    dist_amount_cny = dist['金額（元）']
-                    dist_amount_jpy = dist_amount_cny * cny_to_jpy_rate
-                    # 配分先ASINの数で割る
-                    num_target_asins = len(dist['ASINs'])
-                    if num_target_asins > 0:
-                        # さらに、そのASINの数量で割る
-                        dist_per_item = (dist_amount_jpy / num_target_asins) / qty if qty > 0 else 0
+                # 手動分配情報の形式（{'asin': '...', 'cost_type': '...', 'amount': ...}）を処理
+                if 'asin' in dist and 'amount' in dist:
+                    # 手動分配情報の形式
+                    if dist.get('asin', '') == asin:
+                        dist_amount_cny = dist.get('amount', 0)
+                        dist_amount_jpy = dist_amount_cny * cny_to_jpy_rate
+                        # そのASINの数量で割る
+                        dist_per_item = dist_amount_jpy / qty if qty > 0 else 0
                         additional_option_fee_jpy += dist_per_item
-                        print(f"追加配分: {dist['説明']} = {dist_per_item}円/個")
+                        cost_type = dist.get('cost_type', '手動分配')
+                        print(f"追加配分（手動）: {cost_type} = {dist_per_item}円/個 (元: {dist_amount_cny}元)")
+                # 従来の形式（{'ASINs': [...], '金額（元）': ..., '説明': ...}）を処理
+                elif 'ASINs' in dist:
+                    if asin in dist['ASINs']:
+                        # この配分がこのASINに適用される
+                        dist_amount_cny = dist['金額（元）']
+                        dist_amount_jpy = dist_amount_cny * cny_to_jpy_rate
+                        # 配分先ASINの数で割る
+                        num_target_asins = len(dist['ASINs'])
+                        if num_target_asins > 0:
+                            # さらに、そのASINの数量で割る
+                            dist_per_item = (dist_amount_jpy / num_target_asins) / qty if qty > 0 else 0
+                            additional_option_fee_jpy += dist_per_item
+                            print(f"追加配分: {dist['説明']} = {dist_per_item}円/個")
         
-        # 合計オプション費用
+        # 3-2. 手動分配情報がない場合、差額を全ASINに均等配分（フォールバック）
+        # ただし、最初のASINの処理時のみ計算して、以降は同じ値を参照
+        if abs(additional_option_fee_jpy) < 0.01 and abs(option_difference_cny) > 0.01:
+            # 手動分配情報がない場合のみ、差額を全ASINに均等配分
+            if asin == fba_df.iloc[0]['ASIN']:
+                # 全ASINの数量合計を計算
+                total_qty_all_asins = fba_df['数量'].sum() if '数量' in fba_df.columns else 0
+                if total_qty_all_asins > 0:
+                    # 差額を全ASINの数量合計で割って、さらにこのASINの数量で割る
+                    difference_per_item_cny = option_difference_cny / total_qty_all_asins
+                    difference_per_item_jpy = difference_per_item_cny * cny_to_jpy_rate
+                    additional_option_fee_jpy = difference_per_item_jpy
+                    print(f"追加配分（自動・差額均等配分）: {difference_per_item_jpy}円/個 (元: {difference_per_item_cny}元)")
+            else:
+                # 最初のASINで計算した値を再利用（簡易実装）
+                # より正確には、全ASINの数量合計を計算して配分すべきだが、ここでは簡易的に処理
+                total_qty_all_asins = fba_df['数量'].sum() if '数量' in fba_df.columns else 0
+                if total_qty_all_asins > 0:
+                    difference_per_item_cny = option_difference_cny / total_qty_all_asins
+                    difference_per_item_jpy = difference_per_item_cny * cny_to_jpy_rate
+                    additional_option_fee_jpy = difference_per_item_jpy
+                    print(f"追加配分（自動・差額均等配分）: {difference_per_item_jpy}円/個 (元: {difference_per_item_cny}元)")
+        
+        # 合計オプション費用 = 指示書の基本オプション費用 + 差額による追加オプション費用
         total_option_fee_per_item_jpy = base_option_fee_per_item_jpy + additional_option_fee_jpy
         result['商品1個あたりのオプション費用（円）'] = total_option_fee_per_item_jpy
         result['商品1個あたりのオプション費用（元）'] = total_option_fee_per_item_jpy / cny_to_jpy_rate if cny_to_jpy_rate > 0 else 0
@@ -2190,6 +2718,7 @@ def display_data_flow():
 
 def main():
     """メインアプリケーション"""
+    import pandas as pd  # 関数内で明示的にインポート
     initialize_session_state()
     
     # ヘッダー
@@ -2219,6 +2748,123 @@ def main():
     
     with tab1:
         st.markdown('<div class="section-header">ファイルをアップロード</div>', unsafe_allow_html=True)
+        
+        # フォルダ選択機能（ファイルアップロードを使用）
+        st.markdown("### 📁 フォルダ内ファイル一括アップロード（推奨）")
+        st.info("💡 **「Browse files」をクリックしてフォルダを開き、Ctrl+A（Windows）または Cmd+A（Mac）で全ファイルを選択してください。**")
+        
+        uploaded_files_batch = st.file_uploader(
+            "フォルダ内の全ファイルを選択",
+            type=['xls', 'xlsx', 'pdf', 'txt'],
+            accept_multiple_files=True,
+            help="【使い方】\n"
+                 "1. 「Browse files」をクリック\n"
+                 "2. フォルダを開く\n"
+                 "3. Ctrl+A（Windows）または Cmd+A（Mac）で全ファイルを選択\n"
+                 "4. 「開く」をクリック\n\n"
+                 "【自動判別されるファイル】\n"
+                 "• FBA指示書（ファイル名に「FBA指示書」を含む）\n"
+                 "• send-order-list（ファイル名に「send-order-list」を含む）\n"
+                 "• record-list（ファイル名に「record-list」を含む）\n"
+                 "• jancode-list（ファイル名に「jancode-list」を含む）\n"
+                 "• 輸入許可通知書（PDFファイル）\n"
+                 "• メール情報（ファイル名に「配送依頼No.」を含む.txtファイル）"
+        )
+        
+        if uploaded_files_batch:
+            detected_files = {}
+            processed_count = 0
+            
+            # ファイルタイプとラベルのマッピング（個別アップロードと同じ形式に統一）
+            file_type_mapping = {
+                'fba': {
+                    'save_type': 'fba_instruction',
+                    'label': 'FBA指示書',
+                    'key': 'fba'
+                },
+                'send_order': {
+                    'save_type': 'send_order_list',
+                    'label': 'send-order-list',
+                    'key': 'send_order'
+                },
+                'record_list': {
+                    'save_type': 'record_list',
+                    'label': 'record-list',
+                    'key': 'record_list'
+                },
+                'jancode': {
+                    'save_type': 'jancode',
+                    'label': 'Jancode.xlsx',
+                    'key': 'jancode'
+                },
+                'import_permit': {
+                    'save_type': 'import_permit',
+                    'label': '輸入許可通知書',
+                    'key': 'import_permit'
+                },
+                'email_text': {
+                    'save_type': 'email_text',
+                    'label': 'メール情報',
+                    'key': 'email_text'
+                }
+            }
+            
+            for uploaded_file in uploaded_files_batch:
+                file_type = detect_file_type(uploaded_file.name)
+                # ルールに該当するファイルのみ処理（該当しないファイルは静かにスキップ）
+                if file_type and file_type in file_type_mapping:
+                    mapping = file_type_mapping[file_type]
+                    file_path = save_uploaded_file(uploaded_file, mapping['save_type'])
+                    if file_path:
+                        detected_files[mapping['key']] = file_path
+                        processed_count += 1
+                        # ファイル情報を保存（個別アップロードと同じ形式）
+                        if 'file_info' not in st.session_state:
+                            st.session_state.file_info = {}
+                        st.session_state.file_info[mapping['key']] = {
+                            "label": mapping['label'],
+                            "loaded": True,
+                            "filename": uploaded_file.name
+                        }
+                        # メタデータの抽出（FBA指示書の場合）
+                        if file_type == 'fba':
+                            fba_meta = parse_fba_filename_metadata(uploaded_file.name)
+                            if fba_meta:
+                                st.session_state.metadata.update(fba_meta)
+                        # 配送日の抽出（send-order-listの場合）
+                        elif file_type == 'send_order':
+                            shipping_date = parse_send_order_filename(uploaded_file.name)
+                            if shipping_date:
+                                st.session_state.metadata['shipping_date'] = shipping_date
+                        # メール情報の解析（email_textの場合）
+                        elif file_type == 'email_text':
+                            parsed_email_data = parse_email_text_file(file_path)
+                            if parsed_email_data:
+                                # セッション状態の初期化（個別アップロードと同じ処理）
+                                if 'email_data' not in st.session_state:
+                                    st.session_state.email_data = {}
+                                
+                                # 解析結果をセッション状態に追加（個別アップロードと同じ処理）
+                                for shipping_no, data in parsed_email_data.items():
+                                    st.session_state.email_data[shipping_no] = data
+                                
+                                # 成功メッセージを表示（個別アップロードと同じ形式）
+                                shipping_nos = list(parsed_email_data.keys())
+                                st.success(f"✅ **{uploaded_file.name}** → {mapping['label']}として認識されました")
+                                st.success(f"✓ メール情報を読み込みました（配送依頼No. {', '.join(shipping_nos)}）")
+                            else:
+                                st.warning(f"⚠️ **{uploaded_file.name}** のメール情報の解析に失敗しました。ファイル形式を確認してください。")
+                                st.success(f"✅ **{uploaded_file.name}** → {mapping['label']}として認識されました")
+                        else:
+                            # その他のファイルタイプの成功メッセージ
+                            st.success(f"✅ **{uploaded_file.name}** → {mapping['label']}として認識されました")
+            
+            if detected_files:
+                st.session_state.uploaded_files.update(detected_files)
+                st.success(f"🎉 **{len(detected_files)}個のファイルが正常にアップロードされました**（処理対象: {processed_count}ファイル）")
+        
+        st.markdown("---")
+        st.markdown("### 📁 個別アップロード（従来方式）")
         
         col1, col2 = st.columns(2)
         
@@ -2338,196 +2984,56 @@ def main():
                     "loaded": True,
                     "filename": option_dist_file.name
                 }
+            
+            # メール情報テキストファイル
+            email_text_file = st.file_uploader(
+                "メール情報 (.txt)",
+                type=['txt'],
+                help="メール本文をそのまま貼り付けたテキストファイル（配送依頼No.、国際送料、オプション料金、通関手数料、中国国内送料を含む）"
+            )
+            if email_text_file:
+                email_path = save_uploaded_file(email_text_file, "email_text")
+                st.session_state.uploaded_files['email_text'] = email_path
+                st.session_state.file_info['email_text'] = {
+                    "label": "メール情報",
+                    "loaded": True,
+                    "filename": email_text_file.name
+                }
+                
+                # メール情報を解析
+                parsed_email_data = parse_email_text_file(email_path)
+                if parsed_email_data:
+                    # セッション状態の初期化
+                    if 'email_data' not in st.session_state:
+                        st.session_state.email_data = {}
+                    
+                    # 解析結果をセッション状態に追加
+                    for shipping_no, data in parsed_email_data.items():
+                        st.session_state.email_data[shipping_no] = data
+                    
+                    st.success(f"✓ メール情報を読み込みました（配送依頼No. {', '.join(parsed_email_data.keys())}）")
+                else:
+                    st.warning("⚠️ メール情報の解析に失敗しました。ファイル形式を確認してください。")
         
-        # メール情報の手動入力セクション
+        # メール情報の手動入力セクション（フォールバック）
         st.markdown("---")
-        st.subheader("📧 メールから取得する情報の手動入力")
-        st.caption("配送依頼ごとの国際送料、オプション料金、通関手数料、中国国内送料を入力してください")
+        st.subheader("📧 メールから取得する情報")
+        st.caption("テキストファイルをアップロードするか、手動で入力してください")
         
         # セッション状態の初期化
         if 'email_data' not in st.session_state:
             st.session_state.email_data = {}
         
-        with st.expander("✍️ メール情報を入力", expanded=False):
-            # 配送依頼番号を入力
-            delivery_request_no = st.text_input(
-                "配送依頼No.",
-                placeholder="例: 663864",
-                help="この配送依頼に関する情報を入力します",
-                key="delivery_no_input"
-            )
-            
-            if delivery_request_no:
-                st.markdown(f"**配送依頼No. {delivery_request_no} の情報**")
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.markdown("**基本料金（元）**")
-                    international_shipping = st.number_input(
-                        "国際送料（元）",
-                        min_value=0.0,
-                        value=0.0,
-                        step=10.0,
-                        format="%.2f",
-                        key=f"intl_ship_{delivery_request_no}"
-                    )
-                    
-                    option_fee = st.number_input(
-                        "オプション料金（元）",
-                        min_value=0.0,
-                        value=0.0,
-                        step=10.0,
-                        format="%.2f",
-                        key=f"option_{delivery_request_no}"
-                    )
-                    
-                    customs_fee = st.number_input(
-                        "通関手数料（元）",
-                        min_value=0.0,
-                        value=0.0,
-                        step=1.0,
-                        format="%.2f",
-                        key=f"customs_fee_{delivery_request_no}"
-                    )
-                    
-                    domestic_shipping = st.number_input(
-                        "中国国内送料（元）",
-                        min_value=0.0,
-                        value=0.0,
-                        step=10.0,
-                        format="%.2f",
-                        key=f"domestic_{delivery_request_no}"
-                    )
-                
-                with col2:
-                    st.markdown("**オプション料金の内訳（任意）**")
-                    st.caption("オプション料金の詳細がある場合に入力")
-                    
-                    special_inspection = st.number_input(
-                        "特殊検品（元）",
-                        min_value=0.0,
-                        value=0.0,
-                        step=1.0,
-                        format="%.2f",
-                        key=f"special_{delivery_request_no}"
-                    )
-                    
-                    full_inspection = st.number_input(
-                        "全開封検査（元）",
-                        min_value=0.0,
-                        value=0.0,
-                        step=1.0,
-                        format="%.2f",
-                        key=f"full_insp_{delivery_request_no}"
-                    )
-                    
-                    photography = st.number_input(
-                        "撮影（元）",
-                        min_value=0.0,
-                        value=0.0,
-                        step=1.0,
-                        format="%.2f",
-                        key=f"photo_{delivery_request_no}"
-                    )
-                    
-                    other_option = st.number_input(
-                        "その他オプション（元）",
-                        min_value=0.0,
-                        value=0.0,
-                        step=1.0,
-                        format="%.2f",
-                        key=f"other_{delivery_request_no}"
-                    )
-                
-                # オプション費用の追加配分設定
-                st.markdown("---")
-                st.markdown("**📌 追加オプション費用の配分（例外処理4）**")
-                st.caption("指示書に記載されていない追加オプション費用がある場合、特定のASINに配分します")
-                
-                if 'option_distribution' not in st.session_state:
-                    st.session_state.option_distribution = {}
-                if delivery_request_no not in st.session_state.option_distribution:
-                    st.session_state.option_distribution[delivery_request_no] = []
-                
-                # 配分設定の追加
-                with st.expander("➕ オプション費用配分を追加", expanded=False):
-                    col_desc, col_amount, col_asins = st.columns([2, 1, 3])
-                    
-                    with col_desc:
-                        dist_description = st.text_input(
-                            "説明",
-                            placeholder="例: 特殊検品",
-                            key=f"dist_desc_{delivery_request_no}"
-                        )
-                    
-                    with col_amount:
-                        dist_amount = st.number_input(
-                            "金額（元）",
-                            min_value=0.0,
-                            value=0.0,
-                            step=1.0,
-                            format="%.2f",
-                            key=f"dist_amount_{delivery_request_no}"
-                        )
-                    
-                    with col_asins:
-                        dist_asins = st.text_input(
-                            "配分先ASIN（カンマ区切り）",
-                            placeholder="例: B0BKFS9N54, B0G1LDVHGV",
-                            key=f"dist_asins_{delivery_request_no}"
-                        )
-                    
-                    if st.button("配分を追加", key=f"add_dist_{delivery_request_no}"):
-                        if dist_description and dist_amount > 0 and dist_asins:
-                            asin_list = [a.strip() for a in dist_asins.split(',')]
-                            st.session_state.option_distribution[delivery_request_no].append({
-                                '説明': dist_description,
-                                '金額（元）': dist_amount,
-                                'ASINs': asin_list
-                            })
-                            st.success(f"配分を追加しました: {dist_description} - {dist_amount}元")
-                        else:
-                            st.error("すべてのフィールドを入力してください")
-                
-                # 現在の配分設定を表示
-                if st.session_state.option_distribution.get(delivery_request_no):
-                    st.markdown("**現在の配分設定:**")
-                    for idx, dist in enumerate(st.session_state.option_distribution[delivery_request_no]):
-                        col_info, col_delete = st.columns([4, 1])
-                        with col_info:
-                            st.text(f"{dist['説明']}: {dist['金額（元）']}元 → {', '.join(dist['ASINs'])}")
-                        with col_delete:
-                            if st.button("🗑️", key=f"del_dist_{delivery_request_no}_{idx}"):
-                                st.session_state.option_distribution[delivery_request_no].pop(idx)
-                                st.rerun()
-                
-                # データを保存
-                col_save, col_delete = st.columns([3, 1])
-                with col_save:
-                    if st.button("💾 保存", key=f"save_{delivery_request_no}", type="primary"):
-                        st.session_state.email_data[delivery_request_no] = {
-                            '国際送料': international_shipping,
-                            'オプション料金': option_fee,
-                            '通関手数料': customs_fee,
-                            '中国国内送料': domestic_shipping,
-                            '特殊検品': special_inspection,
-                            '全開封検査': full_inspection,
-                            '撮影': photography,
-                            'その他オプション': other_option
-                        }
-                        st.success(f"✓ 配送依頼No. {delivery_request_no} の情報を保存しました")
-                        
-                        # 合計を表示
-                        total = international_shipping + option_fee + customs_fee + domestic_shipping
-                        st.info(f"**合計:** {total:,.2f} 元")
-                
-                with col_delete:
-                    if delivery_request_no in st.session_state.email_data:
-                        if st.button("🗑️ 削除", key=f"delete_{delivery_request_no}"):
-                            del st.session_state.email_data[delivery_request_no]
-                            st.success(f"削除しました")
-                            st.rerun()
+        # アップロードされたメールテキストファイルのプレビュー
+        if 'email_text' in st.session_state.uploaded_files:
+            email_path = st.session_state.uploaded_files['email_text']
+            with st.expander("📄 アップロードされたメール情報（プレビュー）", expanded=True):
+                try:
+                    with open(email_path, 'r', encoding='utf-8') as f:
+                        email_content = f.read()
+                    st.text_area("メール内容", email_content, height=200, disabled=True)
+                except Exception as e:
+                    st.error(f"ファイル読み込みエラー: {e}")
         
         # 保存済みのメール情報を表示
         if st.session_state.email_data:
@@ -2545,19 +3051,27 @@ def main():
                         st.metric("通関手数料", f"{data.get('通関手数料', 0):,.2f} 元")
                         st.metric("中国国内送料", f"{data.get('中国国内送料', 0):,.2f} 元")
                     
-                    # オプション内訳がある場合
+                    # オプション内訳項目を表示
                     option_details = []
                     if data.get('特殊検品', 0) > 0:
-                        option_details.append(f"特殊検品={data['特殊検品']:.2f}元")
+                        option_details.append(('特殊検品', data.get('特殊検品', 0)))
                     if data.get('全開封検査', 0) > 0:
-                        option_details.append(f"全開封検査={data['全開封検査']:.2f}元")
+                        option_details.append(('全開封検査', data.get('全開封検査', 0)))
                     if data.get('撮影', 0) > 0:
-                        option_details.append(f"撮影={data['撮影']:.2f}元")
+                        option_details.append(('撮影', data.get('撮影', 0)))
                     if data.get('その他オプション', 0) > 0:
-                        option_details.append(f"その他={data['その他オプション']:.2f}元")
+                        option_details.append(('その他オプション', data.get('その他オプション', 0)))
                     
                     if option_details:
-                        st.caption(f"オプション内訳: {', '.join(option_details)}")
+                        st.markdown("**オプション内訳:**")
+                        detail_cols = st.columns(len(option_details))
+                        for idx, (name, value) in enumerate(option_details):
+                            with detail_cols[idx]:
+                                st.metric(name, f"{value:,.2f} 元")
+                    
+                    # オプション料金はメールテキストから取得
+                    if data.get('オプション料金', 0) > 0:
+                        st.caption(f"💡 オプション料金はメールテキストから自動取得されました")
                     
                     # 合計
                     total = (data.get('国際送料', 0) + data.get('オプション料金', 0) + 
@@ -2587,6 +3101,7 @@ def main():
                     
                     # オプション費用列をハイライト
                     def highlight_fba_option_cost(df):
+                        import pandas as pd
                         styles = pd.DataFrame('', index=df.index, columns=df.columns)
                         if 'オプション費用（元）' in df.columns:
                             styles['オプション費用（元）'] = 'background-color: #E8F4F8; border-left: 3px solid #4A90A4; font-weight: 500;'
@@ -2608,6 +3123,9 @@ def main():
                     total_option_cost = instruction_df['オプション費用（元）'].sum() if 'オプション費用（元）' in instruction_df.columns else 0
                     instruction_order_count = getattr(instruction_df, 'attrs', {}).get('instruction_order_count', 0)
                     
+                    # オプション費用合計をセッション状態に保存（後でメール情報と比較するため）
+                    st.session_state['instruction_total_option_cost'] = total_option_cost
+                    
                     col1, col2, col3 = st.columns(3)
                     with col1:
                         st.metric("指示書の数量合計", f"{total_qty:,.0f}個")
@@ -2621,9 +3139,20 @@ def main():
                     # ここでは一時的にプレースホルダーを表示
                     st.session_state['instruction_asins'] = asins
             order_numbers = []
+            import pandas as pd
             send_order_matches = pd.DataFrame()
             send_order_asins = []
-            for file_type, file_path in st.session_state.uploaded_files.items():
+            
+            # ファイル処理順序を定義（個別アップロードと同じ順序に統一）
+            # FBA指示書、send-order-list、record-list、jancode-listの順序
+            file_display_order = ['fba', 'send_order', 'record_list', 'jancode', 'import_permit', 'email_text', 'manual_input', 'option_distribution']
+            
+            # 定義された順序でファイルを処理
+            for file_type in file_display_order:
+                if file_type not in st.session_state.uploaded_files:
+                    continue
+                
+                file_path = st.session_state.uploaded_files[file_type]
                 if not file_path or not os.path.exists(file_path):
                     continue
                 
@@ -2636,6 +3165,7 @@ def main():
                         
                         # 寸法情報（国際送料計算に使用）をハイライト
                         def highlight_jancode_dimensions(df):
+                            import pandas as pd
                             styles = pd.DataFrame('', index=df.index, columns=df.columns)
                             dimension_cols = ['長さ(cm)', '幅(cm)', '高さ(cm)', '寸法3辺合計(cm)']
                             for col in dimension_cols:
@@ -2692,6 +3222,7 @@ def main():
                         
                         # 原価計算に使用される列をハイライト
                         def highlight_send_order_cost_columns(df):
+                            import pandas as pd
                             styles = pd.DataFrame('', index=df.index, columns=df.columns)
                             if '購入単価（元）' in df.columns:
                                 styles['購入単価（元）'] = 'background-color: #E8F4F8; border-left: 3px solid #4A90A4; font-weight: 500;'
@@ -2711,6 +3242,62 @@ def main():
                         styled_send_order = styled_send_order.format(format_dict, na_rep='-')
                         
                         st.dataframe(styled_send_order, width='stretch', height=200)
+                        
+                        # 中国国内送料の突合チェック
+                        if 'email_data' in st.session_state and st.session_state.email_data:
+                            # 配送依頼番号を取得（metadataから）
+                            shipping_request_no = st.session_state.metadata.get('shipping_request_no', '')
+                            
+                            # 配送依頼番号が見つからない場合は、メール情報の最初のキーを使用
+                            if not shipping_request_no and st.session_state.email_data:
+                                shipping_request_no = list(st.session_state.email_data.keys())[0]
+                            
+                            # 該当するメール情報を取得
+                            if shipping_request_no and shipping_request_no in st.session_state.email_data:
+                                email_data = st.session_state.email_data[shipping_request_no]
+                                email_domestic_shipping = email_data.get('中国国内送料', 0)
+                                
+                                # send_orderから各ASINの中国国内送料を取得して合計
+                                send_order_domestic_shipping_total = 0
+                                if '中国国内送料（元）' in detail_df.columns:
+                                    # 各ASINの中国国内送料を合計
+                                    send_order_domestic_shipping_total = detail_df['中国国内送料（元）'].sum()
+                                
+                                # 比較
+                                if email_domestic_shipping > 0 or send_order_domestic_shipping_total > 0:
+                                    st.markdown("---")
+                                    st.subheader("🚚 中国国内送料の突合チェック")
+                                    
+                                    # 差額を計算（小数点以下の誤差を考慮）
+                                    difference = abs(email_domestic_shipping - send_order_domestic_shipping_total)
+                                    tolerance = 0.01  # 0.01元以下の差は一致とみなす
+                                    
+                                    if difference <= tolerance:
+                                        st.success(f"✅ **一致**: メールとsend_orderの中国国内送料が一致しています")
+                                        st.caption(f"メール: {email_domestic_shipping:,.2f} 元 | send_order合計: {send_order_domestic_shipping_total:,.2f} 元")
+                                    else:
+                                        st.warning(f"⚠️ **不一致**: メールとsend_orderの中国国内送料に差があります")
+                                        
+                                        col1, col2, col3 = st.columns(3)
+                                        with col1:
+                                            st.metric("メールの中国国内送料", f"{email_domestic_shipping:,.2f} 元")
+                                        with col2:
+                                            st.metric("send_orderの合計", f"{send_order_domestic_shipping_total:,.2f} 元")
+                                        with col3:
+                                            delta_value = send_order_domestic_shipping_total - email_domestic_shipping
+                                            delta_label = "差額"
+                                            st.metric(
+                                                delta_label,
+                                                f"{difference:,.2f} 元",
+                                                delta=f"{delta_value:,.2f} 元" if delta_value != 0 else None
+                                            )
+                                        
+                                        # 詳細を表示
+                                        if '中国国内送料（元）' in detail_df.columns:
+                                            st.markdown("**send_orderの各ASINの中国国内送料:**")
+                                            domestic_shipping_detail = detail_df[['ASIN', '中国国内送料（元）']].copy() if 'ASIN' in detail_df.columns else pd.DataFrame()
+                                            if not domestic_shipping_detail.empty:
+                                                st.dataframe(domestic_shipping_detail, width='stretch', hide_index=True)
                         
                         # send-order-list全体から注文番号を取得（ASINごとに集約される前のデータ）
                         send_order_df_full = None
@@ -2783,6 +3370,7 @@ def main():
                                 order_numbers = []
                         
                         if order_numbers:
+                            import pandas as pd
                             send_order_matches = detail_df[['ASIN', '注文番号']].drop_duplicates() if '注文番号' in detail_df.columns else pd.DataFrame()
                     continue  # display_data_preview をスキップ
                 
@@ -2943,13 +3531,39 @@ def main():
                                     
                                     if 'extraction_reason' in debug_info:
                                         st.write("**抽出を実行した理由:**", debug_info['extraction_reason'])
+                                    
+                                    # num/priceの抽出情報を表示
+                                    st.write("---")
+                                    st.write("**📦 数量（num）と価格（price）の抽出情報:**")
+                                    if 'num_price_source_col' in debug_info:
+                                        st.success(f"✅ 抽出元の列: **{debug_info['num_price_source_col']}**")
+                                        if 'num_extracted_count' in debug_info:
+                                            st.write(f"**抽出された数量（num）の件数:** {debug_info['num_extracted_count']}件")
+                                        if 'price_extracted_count' in debug_info:
+                                            st.write(f"**抽出された価格（price）の件数:** {debug_info['price_extracted_count']}件")
+                                        
+                                        if 'num_samples' in debug_info and debug_info['num_samples']:
+                                            st.write("**数量（num）のサンプル:**", ', '.join(map(str, debug_info['num_samples'])))
+                                        if 'price_samples' in debug_info and debug_info['price_samples']:
+                                            st.write("**価格（price）のサンプル:**", ', '.join(map(str, debug_info['price_samples'])))
+                                        
+                                        if 'num_price_source_texts' in debug_info and debug_info['num_price_source_texts']:
+                                            st.write("**📝 抽出元のテキストサンプル:**")
+                                            for i, text in enumerate(debug_info['num_price_source_texts'][:3], 1):
+                                                st.code(text, language='text')
+                                    elif 'num_price_extraction_skipped' in debug_info:
+                                        st.warning(f"⚠️ {debug_info['num_price_extraction_skipped']}")
+                                    else:
+                                        st.info("💡 num/priceの抽出情報がありません")
                         
-                        # 注文番号・金額（CNY）・参考金額（JPY）を表示
-                        display_cols = [col for col in ['注文番号', '金額（CNY）', '参考金額（JPY）'] if col in record_df.columns]
+                        # 注文番号・金額（CNY）・参考金額（JPY）・数量（num）・価格（price）を表示
+                        display_cols = [col for col in ['注文番号', '金額（CNY）', '参考金額（JPY）', '数量（num）', '価格（price）'] if col in record_df.columns]
                         if display_cols:
                             # 金額列が含まれているか確認
                             has_cny = '金額（CNY）' in display_cols
                             has_jpy = '参考金額（JPY）' in display_cols
+                            has_num = '数量（num）' in display_cols
+                            has_price = '価格（price）' in display_cols
                             
                             if not has_cny or not has_jpy:
                                 missing_cols = []
@@ -2960,7 +3574,399 @@ def main():
                                 st.warning(f"⚠️ 以下の列が見つかりませんでした: {', '.join(missing_cols)}")
                                 st.info("💡 デバッグ情報を展開して、検出された列名を確認してください。")
                             
+                            # num/priceの抽出状況を表示
+                            if has_num or has_price:
+                                extracted_info = []
+                                if has_num:
+                                    extracted_info.append("数量（num）")
+                                if has_price:
+                                    extracted_info.append("価格（price）")
+                                st.success(f"✅ 以下の情報が抽出されました: {', '.join(extracted_info)}")
+                            elif debug_info and ('num_price_source_col' in debug_info or 'num_price_extraction_skipped' in debug_info):
+                                st.info("💡 数量（num）と価格（price）の抽出を試みましたが、データが見つかりませんでした。デバッグ情報を確認してください。")
+                            
                             st.dataframe(record_df[display_cols], width='stretch', height=200)
+                            
+                            # send_orderとrecord_listの商品金額（元）の突合チェック
+                            if 'send_order' in st.session_state.uploaded_files and not record_df.empty:
+                                st.markdown("---")
+                                st.subheader("💰 商品金額（元）の突合チェック")
+                                st.caption("send_orderとrecord_listで注文番号に従う商品1個に対する商品金額（元）を比較")
+                                
+                                # send_orderの全データを取得（ASINごとに集約される前のデータ）
+                                send_order_file_path = st.session_state.uploaded_files['send_order']
+                                try:
+                                    send_order_df_full, _ = load_table_with_html_fallback(send_order_file_path)
+                                    send_order_df_full.columns = send_order_df_full.columns.str.strip()
+                                    header_keywords = ['ASIN', '注文', 'order', 'customer']
+                                    send_order_df_full = promote_header_row(send_order_df_full, header_keywords)
+                                    
+                                    # 必要な列を検出
+                                    order_col_so = find_matching_column(send_order_df_full, ['注文番号', '注文ID', 'order_no', 'order number', 'オーダー番号'])
+                                    asin_col_so = find_matching_column(send_order_df_full, ['ASIN', 'asin'])
+                                    customer_col_so = find_matching_column(send_order_df_full, ['お客様管理番号', '顧客管理No', 'customer_number', '顧客番号', 'customer id', '顧客管理番号'])
+                                    price_col_so = find_matching_column(send_order_df_full, ['単価', '購入単価', 'unit_price', 'price', '商品金額', 'product_amount'])
+                                    qty_col_so = find_matching_column(send_order_df_full, ['数量', '個数', 'qty'])
+                                    
+                                    if order_col_so and asin_col_so and price_col_so and qty_col_so:
+                                        # 比較結果を格納
+                                        comparison_results = []
+                                        
+                                        # record_listの各注文番号について比較
+                                        if '注文番号' in record_df.columns and '金額（CNY）' in record_df.columns:
+                                            for _, record_row in record_df.iterrows():
+                                                order_no = str(record_row['注文番号']).strip()
+                                                record_amount_cny_raw = record_row.get('金額（CNY）', 0) or 0
+                                                
+                                                # 負の値の場合は絶対値を取る（-9.50 → 9.50）
+                                                record_amount_cny = abs(float(record_amount_cny_raw)) if record_amount_cny_raw else 0
+                                                
+                                                # record_listから数量（num）を取得
+                                                record_num = record_row.get('数量（num）', None)
+                                                if record_num is not None:
+                                                    try:
+                                                        record_num = float(record_num)
+                                                    except (ValueError, TypeError):
+                                                        record_num = None
+                                                else:
+                                                    record_num = None
+                                                
+                                                # send_orderから該当する注文番号を検索
+                                                # 注文番号がカンマ区切りの場合も考慮
+                                                send_order_matches = send_order_df_full[
+                                                    send_order_df_full[order_col_so].astype(str).str.contains(order_no, na=False, regex=False)
+                                                ]
+                                                
+                                                if not send_order_matches.empty:
+                                                    # 各マッチについて比較
+                                                    for _, send_row in send_order_matches.iterrows():
+                                                        send_order_no = str(send_row[order_col_so]).strip()
+                                                        # カンマ区切りの注文番号から該当するものを抽出
+                                                        order_nos_in_cell = [o.strip() for o in str(send_order_no).split(',') if o.strip()]
+                                                        
+                                                        if order_no in order_nos_in_cell or send_order_no == order_no:
+                                                            send_price = send_row.get(price_col_so, 0) or 0
+                                                            send_qty = send_row.get(qty_col_so, 0) or 0
+                                                            
+                                                            # send_orderの1個あたりの金額を計算
+                                                            # send_orderの単価は通常1個あたりの金額なので、そのまま使用
+                                                            # ただし、単価が注文全体の金額である可能性もあるため、数量で割る処理も試す
+                                                            # まずは単価をそのまま使用（1個あたりと仮定）
+                                                            send_price_per_item = send_price
+                                                            
+                                                            # record_listの金額を1個あたりに変換
+                                                            # record_listの金額が注文全体の可能性があるため、send_orderの数量で割る
+                                                            # ただし、record_listの金額が既に1個あたりの可能性もあるため、両方のパターンを試す
+                                                            record_price_per_item_total = record_amount_cny / send_qty if send_qty > 0 else record_amount_cny
+                                                            record_price_per_item_direct = record_amount_cny
+                                                            
+                                                            # どちらのパターンが近いかで判定（差が小さい方を採用）
+                                                            diff_total = abs(send_price_per_item - record_price_per_item_total)
+                                                            diff_direct = abs(send_price_per_item - record_price_per_item_direct)
+                                                            
+                                                            if diff_direct < diff_total:
+                                                                record_price_per_item = record_price_per_item_direct
+                                                            else:
+                                                                record_price_per_item = record_price_per_item_total
+                                                            
+                                                            # 差額を計算
+                                                            difference = abs(send_price_per_item - record_price_per_item)
+                                                            tolerance = 0.01
+                                                            
+                                                            asin = send_row.get(asin_col_so, '') if asin_col_so else ''
+                                                            customer_no = send_row.get(customer_col_so, '') if customer_col_so else ''
+                                                            
+                                                            comparison_results.append({
+                                                                '注文番号': order_no,
+                                                                'ASIN': asin,
+                                                                'お客様管理番号': customer_no,
+                                                                'send_order数量': send_qty,
+                                                                'record_list数量': record_num if record_num is not None else '',
+                                                                'send_order金額（元/個）': send_price_per_item,
+                                                                'record_list金額（元/個）': record_price_per_item,
+                                                                '差額（元）': difference,
+                                                                '一致': difference <= tolerance
+                                                            })
+                                        
+                                        # 結果を表示
+                                        if comparison_results:
+                                            import pandas as pd
+                                            comparison_df = pd.DataFrame(comparison_results)
+                                            
+                                            # 一致/不一致で分類
+                                            matched = comparison_df[comparison_df['一致'] == True]
+                                            mismatched = comparison_df[comparison_df['一致'] == False]
+                                            
+                                            if len(matched) > 0:
+                                                st.success(f"✅ **一致**: {len(matched)}件の注文番号で金額が一致しています")
+                                                
+                                                # 一致した場合も商品数を表示（オプション）
+                                                if st.checkbox("一致したデータも表示", key="show_matched_data"):
+                                                    display_cols_matched = ['注文番号', 'ASIN', 'お客様管理番号', 'send_order数量', 'record_list数量', 'send_order金額（元/個）', 'record_list金額（元/個）']
+                                                    display_cols_matched = [col for col in display_cols_matched if col in matched.columns]
+                                                    matched_display = matched[display_cols_matched].copy()
+                                                    
+                                                    # 数値列をフォーマット
+                                                    for col in ['send_order金額（元/個）', 'record_list金額（元/個）']:
+                                                        if col in matched_display.columns:
+                                                            matched_display[col] = matched_display[col].apply(lambda x: f"{x:,.2f}" if pd.notna(x) and x != '' else '')
+                                                    
+                                                    # 数量列をフォーマット
+                                                    for col in ['send_order数量', 'record_list数量']:
+                                                        if col in matched_display.columns:
+                                                            matched_display[col] = matched_display[col].apply(lambda x: f"{x:,.0f}" if pd.notna(x) and x != '' else '')
+                                                    
+                                                    st.dataframe(matched_display, width='stretch', hide_index=True)
+                                            
+                                            if len(mismatched) > 0:
+                                                st.warning(f"⚠️ **不一致**: {len(mismatched)}件の注文番号で金額が一致しません")
+                                                
+                                                # 不一致の詳細を表示
+                                                display_cols = ['注文番号', 'ASIN', 'お客様管理番号', 'send_order数量', 'record_list数量', 'send_order金額（元/個）', 'record_list金額（元/個）', '差額（元）']
+                                                # 存在する列のみを表示
+                                                display_cols = [col for col in display_cols if col in mismatched.columns]
+                                                mismatched_display = mismatched[display_cols].copy()
+                                                
+                                                # 数値列をフォーマット
+                                                for col in ['send_order金額（元/個）', 'record_list金額（元/個）', '差額（元）']:
+                                                    if col in mismatched_display.columns:
+                                                        mismatched_display[col] = mismatched_display[col].apply(lambda x: f"{x:,.2f}" if pd.notna(x) and x != '' else '')
+                                                
+                                                # 数量列をフォーマット
+                                                for col in ['send_order数量', 'record_list数量']:
+                                                    if col in mismatched_display.columns:
+                                                        mismatched_display[col] = mismatched_display[col].apply(lambda x: f"{x:,.0f}" if pd.notna(x) and x != '' else '')
+                                                
+                                                st.dataframe(mismatched_display, width='stretch', hide_index=True)
+                                            else:
+                                                st.info("💡 すべての注文番号で金額が一致しています")
+                                        else:
+                                            st.info("💡 比較対象のデータが見つかりませんでした")
+                                    else:
+                                        st.warning("⚠️ send_orderから必要な列（注文番号、ASIN、単価、数量）を取得できませんでした")
+                                except Exception as e:
+                                    st.error(f"❌ send_orderデータの読み込みエラー: {e}")
+                                    import traceback
+                                    traceback.print_exc()
+                            
+                            # メールから取得した情報を表示
+                            if 'email_data' in st.session_state and st.session_state.email_data:
+                                # 配送依頼番号を取得（metadataから）
+                                shipping_request_no = st.session_state.metadata.get('shipping_request_no', '')
+                                
+                                # 配送依頼番号が見つからない場合は、メール情報の最初のキーを使用
+                                if not shipping_request_no and st.session_state.email_data:
+                                    shipping_request_no = list(st.session_state.email_data.keys())[0]
+                                
+                                # 該当するメール情報を表示
+                                if shipping_request_no and shipping_request_no in st.session_state.email_data:
+                                    st.markdown("---")
+                                    st.subheader("📧 メールから取得した情報")
+                                    email_data = st.session_state.email_data[shipping_request_no]
+                                    
+                                    col1, col2 = st.columns(2)
+                                    with col1:
+                                        st.metric("国際送料", f"{email_data.get('国際送料', 0):,.2f} 元")
+                                        st.metric("オプション料金", f"{email_data.get('オプション料金', 0):,.2f} 元")
+                                    
+                                    with col2:
+                                        st.metric("通関手数料", f"{email_data.get('通関手数料', 0):,.2f} 元")
+                                        st.metric("中国国内送料", f"{email_data.get('中国国内送料', 0):,.2f} 元")
+                                    
+                                    # オプション内訳項目を表示
+                                    option_details = []
+                                    if email_data.get('特殊検品', 0) > 0:
+                                        option_details.append(('特殊検品', email_data.get('特殊検品', 0)))
+                                    if email_data.get('全開封検査', 0) > 0:
+                                        option_details.append(('全開封検査', email_data.get('全開封検査', 0)))
+                                    if email_data.get('撮影', 0) > 0:
+                                        option_details.append(('撮影', email_data.get('撮影', 0)))
+                                    if email_data.get('その他オプション', 0) > 0:
+                                        option_details.append(('その他オプション', email_data.get('その他オプション', 0)))
+                                    
+                                    if option_details:
+                                        st.markdown("**オプション内訳:**")
+                                        detail_cols = st.columns(len(option_details))
+                                        for idx, (name, value) in enumerate(option_details):
+                                            with detail_cols[idx]:
+                                                st.metric(name, f"{value:,.2f} 元")
+                                    
+                                    # 合計
+                                    total = (email_data.get('国際送料', 0) + email_data.get('オプション料金', 0) + 
+                                            email_data.get('通関手数料', 0) + email_data.get('中国国内送料', 0))
+                                    st.info(f"**合計:** {total:,.2f} 元")
+                                    
+                                    # オプション費用の突合チェック
+                                    instruction_option_cost = st.session_state.get('instruction_total_option_cost', 0)
+                                    email_option_cost = email_data.get('オプション料金', 0)
+                                    
+                                    if instruction_option_cost > 0 or email_option_cost > 0:
+                                        st.markdown("---")
+                                        st.subheader("💰 オプション費用の突合チェック")
+                                        
+                                        # 差額を計算（小数点以下の誤差を考慮）
+                                        difference = abs(instruction_option_cost - email_option_cost)
+                                        tolerance = 0.01  # 0.01元以下の差は一致とみなす
+                                        
+                                        if difference <= tolerance:
+                                            st.success(f"✅ **一致**: 指示書とメールのオプション費用が一致しています")
+                                            st.caption(f"指示書: {instruction_option_cost:,.2f} 元 | メール: {email_option_cost:,.2f} 元")
+                                        else:
+                                            st.warning(f"⚠️ **不一致**: 指示書とメールのオプション費用に差があります")
+                                            
+                                            col1, col2, col3 = st.columns(3)
+                                            with col1:
+                                                st.metric("指示書のオプション費用", f"{instruction_option_cost:,.2f} 元")
+                                            with col2:
+                                                st.metric("メールのオプション費用", f"{email_option_cost:,.2f} 元")
+                                            with col3:
+                                                delta_value = email_option_cost - instruction_option_cost
+                                                delta_label = "差額"
+                                                st.metric(
+                                                    delta_label,
+                                                    f"{difference:,.2f} 元",
+                                                    delta=f"{delta_value:,.2f} 元" if delta_value != 0 else None
+                                                )
+                                            
+                                            # メールのオプション内訳項目を確認
+                                            option_detail_items = []
+                                            if email_data.get('特殊検品', 0) > 0:
+                                                option_detail_items.append(('特殊検品', email_data.get('特殊検品', 0)))
+                                            if email_data.get('全開封検査', 0) > 0:
+                                                option_detail_items.append(('全開封検査', email_data.get('全開封検査', 0)))
+                                            if email_data.get('撮影', 0) > 0:
+                                                option_detail_items.append(('撮影', email_data.get('撮影', 0)))
+                                            if email_data.get('その他オプション', 0) > 0:
+                                                option_detail_items.append(('その他オプション', email_data.get('その他オプション', 0)))
+                                            
+                                            # 各項目の合計を計算
+                                            option_details_total = sum([value for _, value in option_detail_items])
+                                            
+                                            # 差額と各項目の合計が一致するかチェック
+                                            if option_detail_items and abs(option_details_total - difference) <= tolerance:
+                                                st.info(f"💡 **各項目の合計が差額と一致**: {option_details_total:,.2f} 元 = 差額 {difference:,.2f} 元")
+                                                
+                                                # 手動でASINに分配するUI
+                                                with st.expander("🔧 オプション費用をASINに手動分配", expanded=True):
+                                                    st.caption("各項目を指定したASINに分配してください。差額分が各項目の合計と一致する場合、分配できます。")
+                                                    
+                                                    # セッション状態の初期化
+                                                    if 'option_cost_manual_distribution' not in st.session_state:
+                                                        st.session_state.option_cost_manual_distribution = {}
+                                                    
+                                                    distribution_key = f"{shipping_request_no}_distribution"
+                                                    if distribution_key not in st.session_state.option_cost_manual_distribution:
+                                                        st.session_state.option_cost_manual_distribution[distribution_key] = []
+                                    
+                                                    # 指示書からASINリストを取得
+                                                    available_asins = []
+                                                    if 'fba' in st.session_state.uploaded_files:
+                                                        instruction_df = get_instruction_summary(st.session_state.uploaded_files['fba'])
+                                                        if not instruction_df.empty and 'ASIN' in instruction_df.columns:
+                                                            available_asins = instruction_df['ASIN'].dropna().astype(str).unique().tolist()
+                                                    
+                                                    if not available_asins:
+                                                        st.warning("⚠️ 指示書からASINを取得できませんでした")
+                                                    else:
+                                                        # 各項目ごとに分配設定
+                                                        for item_name, item_value in option_detail_items:
+                                                            st.markdown(f"**{item_name}**: {item_value:,.2f} 元")
+                                                            
+                                                            # 既存の分配を取得
+                                                            existing_distributions = [
+                                                                d for d in st.session_state.option_cost_manual_distribution[distribution_key]
+                                                                if d.get('item_name') == item_name
+                                                            ]
+                                                            
+                                                            # 既存のASINリストを取得（カンマ区切り形式）
+                                                            existing_asins_str = ""
+                                                            if existing_distributions:
+                                                                existing_asins = [d.get('asin', '') for d in existing_distributions if d.get('asin')]
+                                                                existing_asins_str = ', '.join(existing_asins)
+                                                            
+                                                            # ASINをカンマ区切りで入力
+                                                            asin_input = st.text_input(
+                                                                f"{item_name}のASIN（カンマ区切り）",
+                                                                value=existing_asins_str,
+                                                                key=f"asin_input_{item_name}_{shipping_request_no}",
+                                                                help="例: B0BKFS9N54, B0G1LDVHGV, B0G1LL31KR"
+                                                            )
+                                                            
+                                                            # ASINをパース
+                                                            if asin_input:
+                                                                asin_list = [asin.strip() for asin in asin_input.split(',') if asin.strip()]
+                                                                
+                                                                if asin_list:
+                                                                    # 各ASINに均等に分配
+                                                                    amount_per_asin = item_value / len(asin_list)
+                                                                    
+                                                                    st.info(f"💡 {len(asin_list)}個のASINに均等分配: 各 {amount_per_asin:,.2f} 元")
+                                                                    
+                                                                    # 分配情報を作成
+                                                                    distributions_for_item = []
+                                                                    for asin in asin_list:
+                                                                        distributions_for_item.append({
+                                                                            'item_name': item_name,
+                                                                            'asin': asin,
+                                                                            'amount': amount_per_asin
+                                                                        })
+                                                                    
+                                                                    # 分配情報を更新
+                                                                    # 既存のこの項目の分配を削除
+                                                                    st.session_state.option_cost_manual_distribution[distribution_key] = [
+                                                                        d for d in st.session_state.option_cost_manual_distribution[distribution_key]
+                                                                        if d.get('item_name') != item_name
+                                                                    ]
+                                                                    # 新しい分配を追加
+                                                                    st.session_state.option_cost_manual_distribution[distribution_key].extend(distributions_for_item)
+                                                                    
+                                                                    # 分配結果を表示
+                                                                    import pandas as pd
+                                                                    distribution_preview = pd.DataFrame([
+                                                                        {'ASIN': dist['asin'], '金額(元)': f"{dist['amount']:,.2f}"}
+                                                                        for dist in distributions_for_item
+                                                                    ])
+                                                                    st.dataframe(distribution_preview, width='stretch', hide_index=True)
+                                                                else:
+                                                                    st.warning("⚠️ ASINが入力されていません")
+                                                            else:
+                                                                # ASINが入力されていない場合、既存の分配を削除
+                                                                st.session_state.option_cost_manual_distribution[distribution_key] = [
+                                                                    d for d in st.session_state.option_cost_manual_distribution[distribution_key]
+                                                                    if d.get('item_name') != item_name
+                                                                ]
+                                                            
+                                                            st.markdown("---")
+                                                        
+                                                        # 分配情報の確認と保存
+                                                        total_distributed = sum([
+                                                            d.get('amount', 0) for d in st.session_state.option_cost_manual_distribution[distribution_key]
+                                                        ])
+                                                        
+                                                        if abs(total_distributed - difference) <= tolerance:
+                                                            st.success(f"✅ 分配完了: 合計 {total_distributed:,.2f} 元 = 差額 {difference:,.2f} 元")
+                                                            
+                                                            # 分配情報を確認表示
+                                                            if st.session_state.option_cost_manual_distribution[distribution_key]:
+                                                                st.markdown("**分配情報:**")
+                                                                distribution_df_data = []
+                                                                for dist in st.session_state.option_cost_manual_distribution[distribution_key]:
+                                                                    distribution_df_data.append({
+                                                                        'ASIN': dist.get('asin', ''),
+                                                                        '項目': dist.get('item_name', ''),
+                                                                        '金額(元)': dist.get('amount', 0)
+                                                                    })
+                                                                if distribution_df_data:
+                                                                    import pandas as pd
+                                                                    distribution_df = pd.DataFrame(distribution_df_data)
+                                                                    st.dataframe(distribution_df, width='stretch')
+                                                        else:
+                                                            st.warning(f"⚠️ 分配金額の合計 ({total_distributed:,.2f} 元) が差額 ({difference:,.2f} 元) と一致しません")
+                                            else:
+                                                if option_detail_items:
+                                                    st.info(f"💡 各項目の合計 ({option_details_total:,.2f} 元) と差額 ({difference:,.2f} 元) が一致しません")
+                                                else:
+                                                    st.info("💡 メールにオプション内訳項目が含まれていません")
                         else:
                             st.error("❌ 注文番号または金額列が見つかりませんでした")
                             st.info("💡 デバッグ情報を展開して、検出された列名を確認してください。")
@@ -3021,6 +4027,225 @@ def main():
                                         st.write("**検出された使用状況列:**", debug_info['detected_detail_col'])
                                     if 'extraction_reason' in debug_info:
                                         st.write("**抽出を実行した理由:**", debug_info['extraction_reason'])
+                        
+                        # メールから取得した情報を表示（record-listが空の場合でも表示）
+                        if 'email_data' in st.session_state and st.session_state.email_data:
+                            # 配送依頼番号を取得（metadataから）
+                            shipping_request_no = st.session_state.metadata.get('shipping_request_no', '')
+                            
+                            # 配送依頼番号が見つからない場合は、メール情報の最初のキーを使用
+                            if not shipping_request_no and st.session_state.email_data:
+                                shipping_request_no = list(st.session_state.email_data.keys())[0]
+                            
+                            # 該当するメール情報を表示
+                            if shipping_request_no and shipping_request_no in st.session_state.email_data:
+                                st.markdown("---")
+                                st.subheader("📧 メールから取得した情報")
+                                email_data = st.session_state.email_data[shipping_request_no]
+                                
+                                col1, col2 = st.columns(2)
+                                with col1:
+                                    st.metric("国際送料", f"{email_data.get('国際送料', 0):,.2f} 元")
+                                    st.metric("オプション料金", f"{email_data.get('オプション料金', 0):,.2f} 元")
+                                
+                                with col2:
+                                    st.metric("通関手数料", f"{email_data.get('通関手数料', 0):,.2f} 元")
+                                    st.metric("中国国内送料", f"{email_data.get('中国国内送料', 0):,.2f} 元")
+                                
+                                # オプション内訳項目を表示
+                                option_details = []
+                                if email_data.get('特殊検品', 0) > 0:
+                                    option_details.append(('特殊検品', email_data.get('特殊検品', 0)))
+                                if email_data.get('全開封検査', 0) > 0:
+                                    option_details.append(('全開封検査', email_data.get('全開封検査', 0)))
+                                if email_data.get('撮影', 0) > 0:
+                                    option_details.append(('撮影', email_data.get('撮影', 0)))
+                                if email_data.get('その他オプション', 0) > 0:
+                                    option_details.append(('その他オプション', email_data.get('その他オプション', 0)))
+                                
+                                if option_details:
+                                    st.markdown("**オプション内訳:**")
+                                    detail_cols = st.columns(len(option_details))
+                                    for idx, (name, value) in enumerate(option_details):
+                                        with detail_cols[idx]:
+                                            st.metric(name, f"{value:,.2f} 元")
+                                
+                                # 合計
+                                total = (email_data.get('国際送料', 0) + email_data.get('オプション料金', 0) + 
+                                        email_data.get('通関手数料', 0) + email_data.get('中国国内送料', 0))
+                                st.info(f"**合計:** {total:,.2f} 元")
+                                
+                                # オプション費用の突合チェック
+                                instruction_option_cost = st.session_state.get('instruction_total_option_cost', 0)
+                                email_option_cost = email_data.get('オプション料金', 0)
+                                
+                                if instruction_option_cost > 0 or email_option_cost > 0:
+                                    st.markdown("---")
+                                    st.subheader("💰 オプション費用の突合チェック")
+                                    
+                                    # 差額を計算（小数点以下の誤差を考慮）
+                                    difference = abs(instruction_option_cost - email_option_cost)
+                                    tolerance = 0.01  # 0.01元以下の差は一致とみなす
+                                    
+                                    if difference <= tolerance:
+                                        st.success(f"✅ **一致**: 指示書とメールのオプション費用が一致しています")
+                                        st.caption(f"指示書: {instruction_option_cost:,.2f} 元 | メール: {email_option_cost:,.2f} 元")
+                                    else:
+                                        st.warning(f"⚠️ **不一致**: 指示書とメールのオプション費用に差があります")
+                                        
+                                        col1, col2, col3 = st.columns(3)
+                                        with col1:
+                                            st.metric("指示書のオプション費用", f"{instruction_option_cost:,.2f} 元")
+                                        with col2:
+                                            st.metric("メールのオプション費用", f"{email_option_cost:,.2f} 元")
+                                        with col3:
+                                            delta_value = email_option_cost - instruction_option_cost
+                                            delta_label = "差額"
+                                            st.metric(
+                                                delta_label,
+                                                f"{difference:,.2f} 元",
+                                                delta=f"{delta_value:,.2f} 元" if delta_value != 0 else None
+                                            )
+                                        
+                                        # メールのオプション内訳項目を確認
+                                        option_detail_items = []
+                                        if email_data.get('特殊検品', 0) > 0:
+                                            option_detail_items.append(('特殊検品', email_data.get('特殊検品', 0)))
+                                        if email_data.get('全開封検査', 0) > 0:
+                                            option_detail_items.append(('全開封検査', email_data.get('全開封検査', 0)))
+                                        if email_data.get('撮影', 0) > 0:
+                                            option_detail_items.append(('撮影', email_data.get('撮影', 0)))
+                                        if email_data.get('その他オプション', 0) > 0:
+                                            option_detail_items.append(('その他オプション', email_data.get('その他オプション', 0)))
+                                        
+                                        # 各項目の合計を計算
+                                        option_details_total = sum([value for _, value in option_detail_items])
+                                        
+                                        # 差額と各項目の合計が一致するかチェック
+                                        if option_detail_items and abs(option_details_total - difference) <= tolerance:
+                                            st.info(f"💡 **各項目の合計が差額と一致**: {option_details_total:,.2f} 元 = 差額 {difference:,.2f} 元")
+                                            
+                                            # 手動でASINに分配するUI
+                                            with st.expander("🔧 オプション費用をASINに手動分配", expanded=True):
+                                                st.caption("各項目を指定したASINに分配してください。差額分が各項目の合計と一致する場合、分配できます。")
+                                                
+                                                # セッション状態の初期化
+                                                if 'option_cost_manual_distribution' not in st.session_state:
+                                                    st.session_state.option_cost_manual_distribution = {}
+                                                
+                                                distribution_key = f"{shipping_request_no}_distribution"
+                                                if distribution_key not in st.session_state.option_cost_manual_distribution:
+                                                    st.session_state.option_cost_manual_distribution[distribution_key] = []
+                                
+                                                # 指示書からASINリストを取得
+                                                available_asins = []
+                                                if 'fba' in st.session_state.uploaded_files:
+                                                    instruction_df = get_instruction_summary(st.session_state.uploaded_files['fba'])
+                                                    if not instruction_df.empty and 'ASIN' in instruction_df.columns:
+                                                        available_asins = instruction_df['ASIN'].dropna().astype(str).unique().tolist()
+                                                
+                                                if not available_asins:
+                                                    st.warning("⚠️ 指示書からASINを取得できませんでした")
+                                                else:
+                                                    # 各項目ごとに分配設定
+                                                    for item_name, item_value in option_detail_items:
+                                                        st.markdown(f"**{item_name}**: {item_value:,.2f} 元")
+                                                        
+                                                        # 既存の分配を取得
+                                                        existing_distributions = [
+                                                            d for d in st.session_state.option_cost_manual_distribution[distribution_key]
+                                                            if d.get('item_name') == item_name
+                                                        ]
+                                                        
+                                                        # 既存のASINリストを取得（カンマ区切り形式）
+                                                        existing_asins_str = ""
+                                                        if existing_distributions:
+                                                            existing_asins = [d.get('asin', '') for d in existing_distributions if d.get('asin')]
+                                                            existing_asins_str = ', '.join(existing_asins)
+                                                        
+                                                        # ASINをカンマ区切りで入力
+                                                        asin_input = st.text_input(
+                                                            f"{item_name}のASIN（カンマ区切り）",
+                                                            value=existing_asins_str,
+                                                            key=f"asin_input_else_{item_name}_{shipping_request_no}",
+                                                            help="例: B0BKFS9N54, B0G1LDVHGV, B0G1LL31KR"
+                                                        )
+                                                        
+                                                        # ASINをパース
+                                                        if asin_input:
+                                                            asin_list = [asin.strip() for asin in asin_input.split(',') if asin.strip()]
+                                                            
+                                                            if asin_list:
+                                                                # 各ASINに均等に分配
+                                                                amount_per_asin = item_value / len(asin_list)
+                                                                
+                                                                st.info(f"💡 {len(asin_list)}個のASINに均等分配: 各 {amount_per_asin:,.2f} 元")
+                                                                
+                                                                # 分配情報を作成
+                                                                distributions_for_item = []
+                                                                for asin in asin_list:
+                                                                    distributions_for_item.append({
+                                                                        'item_name': item_name,
+                                                                        'asin': asin,
+                                                                        'amount': amount_per_asin
+                                                                    })
+                                                                
+                                                                # 分配情報を更新
+                                                                # 既存のこの項目の分配を削除
+                                                                st.session_state.option_cost_manual_distribution[distribution_key] = [
+                                                                    d for d in st.session_state.option_cost_manual_distribution[distribution_key]
+                                                                    if d.get('item_name') != item_name
+                                                                ]
+                                                                # 新しい分配を追加
+                                                                st.session_state.option_cost_manual_distribution[distribution_key].extend(distributions_for_item)
+                                                                
+                                                                # 分配結果を表示
+                                                                import pandas as pd
+                                                                distribution_preview = pd.DataFrame([
+                                                                    {'ASIN': dist['asin'], '金額(元)': f"{dist['amount']:,.2f}"}
+                                                                    for dist in distributions_for_item
+                                                                ])
+                                                                st.dataframe(distribution_preview, width='stretch', hide_index=True)
+                                                            else:
+                                                                st.warning("⚠️ ASINが入力されていません")
+                                                        else:
+                                                            # ASINが入力されていない場合、既存の分配を削除
+                                                            st.session_state.option_cost_manual_distribution[distribution_key] = [
+                                                                d for d in st.session_state.option_cost_manual_distribution[distribution_key]
+                                                                if d.get('item_name') != item_name
+                                                            ]
+                                                        
+                                                        st.markdown("---")
+                                                    
+                                                    # 分配情報の確認と保存
+                                                    total_distributed = sum([
+                                                        d.get('amount', 0) for d in st.session_state.option_cost_manual_distribution[distribution_key]
+                                                    ])
+                                                    
+                                                    if abs(total_distributed - difference) <= tolerance:
+                                                        st.success(f"✅ 分配完了: 合計 {total_distributed:,.2f} 元 = 差額 {difference:,.2f} 元")
+                                                        
+                                                        # 分配情報を確認表示
+                                                        if st.session_state.option_cost_manual_distribution[distribution_key]:
+                                                            st.markdown("**分配情報:**")
+                                                            distribution_df_data = []
+                                                            for dist in st.session_state.option_cost_manual_distribution[distribution_key]:
+                                                                distribution_df_data.append({
+                                                                    'ASIN': dist.get('asin', ''),
+                                                                    '項目': dist.get('item_name', ''),
+                                                                    '金額(元)': dist.get('amount', 0)
+                                                                })
+                                                            if distribution_df_data:
+                                                                import pandas as pd
+                                                                distribution_df = pd.DataFrame(distribution_df_data)
+                                                                st.dataframe(distribution_df, width='stretch')
+                                                    else:
+                                                        st.warning(f"⚠️ 分配金額の合計 ({total_distributed:,.2f} 元) が差額 ({difference:,.2f} 元) と一致しません")
+                                        else:
+                                            if option_detail_items:
+                                                st.info(f"💡 各項目の合計 ({option_details_total:,.2f} 元) と差額 ({difference:,.2f} 元) が一致しません")
+                                            else:
+                                                st.info("💡 メールにオプション内訳項目が含まれていません")
                         else:
                             st.warning("record-list に該当する注文番号が見つかりませんでした")
                     continue  # display_data_preview をスキップ
@@ -3101,6 +4326,10 @@ def main():
                         st.info(f"**税金合計:** ¥{total_tax:,.0f}")
                     
                     continue  # display_data_preview をスキップ
+                
+                # email_textはテキストファイルなので、display_data_previewをスキップ
+                if file_type == 'email_text':
+                    continue  # display_data_preview をスキップ（既にプレビュー表示済み）
                 
                 # その他のファイルタイプは汎用プレビューを表示
                 display_data_preview(file_type, file_path, show_header=True)
@@ -3213,8 +4442,29 @@ def main():
                         email_data = st.session_state.get('email_data', {})
                         
                         # 処理を実行
-                        # オプション費用配分を取得
+                        # オプション費用配分を取得（ファイルから読み込んだもの）
                         option_distribution = st.session_state.get('option_distribution', {})
+                        
+                        # 手動分配情報を取得して統合
+                        manual_distribution = st.session_state.get('option_cost_manual_distribution', {})
+                        if manual_distribution and shipping_request_no:
+                            distribution_key = f"{shipping_request_no}_distribution"
+                            if distribution_key in manual_distribution:
+                                # 手動分配情報をoption_distribution形式に変換
+                                if shipping_request_no not in option_distribution:
+                                    option_distribution[shipping_request_no] = []
+                                
+                                # 手動分配情報を追加（既存の分配情報と統合）
+                                for dist_item in manual_distribution[distribution_key]:
+                                    # 形式: {'item_name': '特殊検品', 'asin': 'B0BKFS9N54', 'amount': 398}
+                                    # option_distribution形式に変換: {'asin': 'B0BKFS9N54', 'cost_type': '特殊検品', 'amount': 398}
+                                    option_distribution[shipping_request_no].append({
+                                        'asin': dist_item.get('asin', ''),
+                                        'cost_type': dist_item.get('item_name', ''),
+                                        'amount': dist_item.get('amount', 0)
+                                    })
+                                
+                                st.info(f"💡 手動分配情報を読み込みました: {len(manual_distribution[distribution_key])}件")
                         
                         results_df = process_data_from_previews(
                             fba_df,
@@ -3352,6 +4602,7 @@ def main():
             # スタイル適用関数
             def highlight_cost_columns(df):
                 """原価計算に使用される列をハイライト"""
+                import pandas as pd
                 # 基本スタイル（全セル）
                 styles = pd.DataFrame('', index=df.index, columns=df.columns)
                 
