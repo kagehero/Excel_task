@@ -748,8 +748,19 @@ def get_instruction_summary(file_path: str) -> pd.DataFrame:
         
         asin_col = find_matching_column(df, ['ASIN', 'asin', 'ASIN番号'])
         product_col = find_matching_column(df, ['商品名', '商品名称', 'product_name', '商品'])
-        # E列「納品個数」を優先的に検出（原価計算の基準）
-        qty_col = find_matching_column(df, ['納品個数', '数量', '個数', 'qty', '数量(個)'])
+        # 「納品個数計算ボックス」を優先的に検出（原価計算の基準）
+        # まず「納品個数計算」を含む列を探す
+        qty_col = None
+        for col in df.columns:
+            col_str = str(col).lower()
+            if '納品個数計算' in col_str or '納品個数計算ボックス' in col_str:
+                qty_col = col
+                log_print(f"\n納品個数計算ボックス列を発見: '{col}'")
+                break
+        # 見つからない場合は、従来の方法で検出
+        if not qty_col:
+            qty_col = find_matching_column(df, ['納品個数計算', '納品個数', '個数', 'qty', '数量(個)'])
+            log_print(f"\n納品個数計算ボックスが見つからないため、通常の数量列を使用: '{qty_col}'")
         
         # promote_header_row前に保存したオプション費用データがあれば使用
         option_col = None
@@ -1647,6 +1658,216 @@ def derive_order_from_row(row) -> str:
     return ''
 
 
+def get_exchange_rate_from_record_list(
+    record_list_file_path: str,
+    search_value: str,
+    operation_type: str,
+    default_rate: float = 22.77
+) -> float:
+    """
+    record-listから為替レートを取得
+    
+    Args:
+        record_list_file_path: record-listファイルのパス
+        search_value: 検索値（オーダーIDまたは配送ID）
+        operation_type: 操作種類（'商品購入' または '国際配送'）
+        default_rate: デフォルトレート（見つからない場合に使用）
+    
+    Returns:
+        為替レート（円/元）
+    """
+    try:
+        df, _ = load_table_with_html_fallback(record_list_file_path)
+        df.columns = df.columns.str.strip()
+        
+        # 検索値を含む列を探す
+        target_col = None
+        target_col_idx = None
+        
+        for idx, col in enumerate(df.columns):
+            # 列の値に検索値が含まれているか確認
+            if df[col].astype(str).str.contains(str(search_value), na=False, regex=False).any():
+                target_col = col
+                target_col_idx = idx
+                break
+        
+        if target_col is None or target_col_idx is None:
+            print(f"⚠️ record-listで{search_value}を含む列が見つかりません。デフォルトレートを使用します。")
+            return default_rate
+        
+        # 該当する行を取得
+        matching_rows = df[df[target_col].astype(str).str.contains(str(search_value), na=False, regex=False)]
+        
+        if matching_rows.empty:
+            print(f"⚠️ record-listで{search_value}に一致する行が見つかりません。デフォルトレートを使用します。")
+            return default_rate
+        
+        # 最初の一致行を使用
+        row = matching_rows.iloc[0]
+        
+        # 列のインデックスから-1（前の列）と-2（さらに前の列）を取得
+        all_cols = df.columns.tolist()
+        
+        # -1列（前の列）を確認
+        if target_col_idx > 0:
+            prev_col = all_cols[target_col_idx - 1]
+            prev_value = str(row[prev_col]).strip() if pd.notna(row[prev_col]) else ''
+            
+            # 操作種類が一致するか確認
+            if operation_type in prev_value:
+                # -2列（さらに前の列）からレートを取得
+                if target_col_idx > 1:
+                    rate_col = all_cols[target_col_idx - 2]
+                    rate_value = row[rate_col]
+                    
+                    # 数値に変換を試みる
+                    try:
+                        rate = float(rate_value)
+                        if rate > 0:
+                            print(f"✅ record-listから{operation_type}の為替レートを取得: {rate} (検索値: {search_value})")
+                            return rate
+                        else:
+                            print(f"⚠️ レート値が0以下です。デフォルトレートを使用します。")
+                            return default_rate
+                    except (ValueError, TypeError):
+                        print(f"⚠️ レート値を数値に変換できませんでした: {rate_value}。デフォルトレートを使用します。")
+                        return default_rate
+                else:
+                    print(f"⚠️ -2列が存在しません。デフォルトレートを使用します。")
+                    return default_rate
+            else:
+                print(f"⚠️ -1列の値 '{prev_value}' が '{operation_type}' と一致しません。デフォルトレートを使用します。")
+                return default_rate
+        else:
+            print(f"⚠️ -1列が存在しません。デフォルトレートを使用します。")
+            return default_rate
+            
+    except Exception as e:
+        print(f"⚠️ record-listから為替レートを取得する際にエラーが発生しました: {e}。デフォルトレートを使用します。")
+        return default_rate
+
+
+def get_exchange_rate_for_unit_price(
+    record_list_file_path: str,
+    order_id: str,
+    default_rate: float = 22.77
+) -> float:
+    """
+    商品の単価の為替レートを取得（オーダーIDを使用）
+    
+    Args:
+        record_list_file_path: record-listファイルのパス
+        order_id: オーダーID（注文番号）
+        default_rate: デフォルトレート
+    
+    Returns:
+        為替レート（円/元）
+    """
+    return get_exchange_rate_from_record_list(
+        record_list_file_path,
+        order_id,
+        '商品購入',
+        default_rate
+    )
+
+
+def get_exchange_rate_for_shipping_and_options(
+    record_list_file_path: str,
+    shipping_id: str,
+    default_rate: float = 22.77
+) -> float:
+    """
+    中国国内送料・オプション費用・国際送料の為替レートを取得（配送IDを使用）
+    
+    Args:
+        record_list_file_path: record-listファイルのパス
+        shipping_id: 配送ID（配送依頼番号）
+        default_rate: デフォルトレート
+    
+    Returns:
+        為替レート（円/元）
+    """
+    return get_exchange_rate_from_record_list(
+        record_list_file_path,
+        shipping_id,
+        '国際配送',
+        default_rate
+    )
+
+
+def get_international_shipping_from_record_list(
+    record_list_file_path: str,
+    shipping_request_no: str
+) -> Optional[float]:
+    """
+    record-listから国際送料を取得
+    
+    Args:
+        record_list_file_path: record-listファイルのパス
+        shipping_request_no: 配送依頼番号（配送ID）
+    
+    Returns:
+        国際送料（元）、見つからない場合はNone
+    """
+    try:
+        df, _ = load_table_with_html_fallback(record_list_file_path)
+        df.columns = df.columns.str.strip()
+        
+        # 「配送ID」という項目がある列を探す
+        shipping_id_col = None
+        shipping_id_col_idx = None
+        
+        for idx, col in enumerate(df.columns):
+            col_str = str(col).strip()
+            # 「配送ID」を含む列を探す
+            if '配送ID' in col_str or '配送id' in col_str.lower() or 'shipping_id' in col_str.lower():
+                shipping_id_col = col
+                shipping_id_col_idx = idx
+                break
+        
+        if shipping_id_col is None or shipping_id_col_idx is None:
+            print(f"⚠️ record-listで「配送ID」を含む列が見つかりません。")
+            return None
+        
+        # 配送依頼番号と一致する行を探す
+        matching_rows = df[df[shipping_id_col].astype(str).str.contains(str(shipping_request_no), na=False, regex=False)]
+        
+        if matching_rows.empty:
+            print(f"⚠️ record-listで配送依頼番号 {shipping_request_no} に一致する行が見つかりません。")
+            return None
+        
+        # 最初の一致行を使用
+        row = matching_rows.iloc[0]
+        
+        # 列のインデックスから+1（次の列）を取得
+        all_cols = df.columns.tolist()
+        
+        # +1列（次の列）から国際送料を取得
+        if shipping_id_col_idx + 1 < len(all_cols):
+            international_shipping_col = all_cols[shipping_id_col_idx + 1]
+            international_shipping_value = row[international_shipping_col]
+            
+            # 数値に変換を試みる
+            try:
+                international_shipping = float(international_shipping_value)
+                if international_shipping >= 0:
+                    print(f"✅ record-listから国際送料を取得: {international_shipping} 元 (配送依頼番号: {shipping_request_no})")
+                    return international_shipping
+                else:
+                    print(f"⚠️ 国際送料値が負の値です: {international_shipping}。Noneを返します。")
+                    return None
+            except (ValueError, TypeError):
+                print(f"⚠️ 国際送料値を数値に変換できませんでした: {international_shipping_value}。Noneを返します。")
+                return None
+        else:
+            print(f"⚠️ +1列が存在しません。Noneを返します。")
+            return None
+            
+    except Exception as e:
+        print(f"⚠️ record-listから国際送料を取得する際にエラーが発生しました: {e}。Noneを返します。")
+        return None
+
+
 def get_record_list_preview(order_numbers: List[str], file_path: str, asin_order_map: pd.DataFrame = None) -> pd.DataFrame:
     """
     order_numbers: send-order-list から取得した注文番号リスト
@@ -2214,44 +2435,29 @@ def get_send_order_preview(asins: List[str], file_path: str) -> pd.DataFrame:
     if '注文番号' not in df.columns:
         df['注文番号'] = df.apply(derive_order_from_row, axis=1)
     
-    # ASIN ごとに1行に集約（指示書の商品数と一致させる）
-    if 'ASIN' in df.columns:
-        # 顧客管理番号（番号）の合計を計算（セット数）
-        if '顧客管理番号（番号）' in df.columns:
-            df['顧客管理番号（番号）'] = pd.to_numeric(df['顧客管理番号（番号）'], errors='coerce').fillna(0)
-        
-        # 注文数をカウント（ASINごとの注文数）
-        df['注文数'] = 1
-        
-        # 数値列は合計、テキスト列は最初の値を使用、注文番号は結合
-        agg_dict = {}
-        for col in df.columns:
-            if col == 'ASIN':
-                continue
-            elif col == '注文番号':
-                agg_dict[col] = lambda x: ', '.join(x.dropna().astype(str).unique())
-            elif col in ['単価（元）', '数量', '中国国内送料（元）', '顧客管理番号（番号）', '注文数']:
-                agg_dict[col] = 'sum'
-            else:
-                agg_dict[col] = 'first'
-        
-        df = df.groupby('ASIN', as_index=False).agg(agg_dict)
-        
-        # 1注文あたりの数量を計算
-        if '注文数' in df.columns and '数量' in df.columns:
-            df['1注文あたり数量'] = df.apply(
-                lambda row: row['数量'] / row['注文数'] if row['注文数'] > 0 else row['数量'],
-                axis=1
-            )
-        
-        # 実際の1セットあたりの数量を計算（セット数がある場合）
-        if '顧客管理番号（番号）' in df.columns and '数量' in df.columns:
-            df['セット数'] = df['顧客管理番号（番号）']
-            # 数量をセット数で割って、1セットあたりの数量を計算
-            df['1セットあたり数量'] = df.apply(
-                lambda row: row['数量'] / row['セット数'] if row['セット数'] > 0 else row['数量'],
-                axis=1
-            )
+    # 各行を個別に出力（ASINごとに集約しない）
+    # 顧客管理番号（番号）を数値に変換
+    if '顧客管理番号（番号）' in df.columns:
+        df['顧客管理番号（番号）'] = pd.to_numeric(df['顧客管理番号（番号）'], errors='coerce').fillna(0)
+    
+    # 注文数を各行で1に設定
+    df['注文数'] = 1
+    
+    # 1注文あたりの数量を計算（各行に対して）
+    if '注文数' in df.columns and '数量' in df.columns:
+        df['1注文あたり数量'] = df.apply(
+            lambda row: row['数量'] / row['注文数'] if row['注文数'] > 0 else row['数量'],
+            axis=1
+        )
+    
+    # 実際の1セットあたりの数量を計算（セット数がある場合、各行に対して）
+    if '顧客管理番号（番号）' in df.columns and '数量' in df.columns:
+        df['セット数'] = df['顧客管理番号（番号）']
+        # 数量をセット数で割って、1セットあたりの数量を計算
+        df['1セットあたり数量'] = df.apply(
+            lambda row: row['数量'] / row['セット数'] if row['セット数'] > 0 else row['数量'],
+            axis=1
+        )
     
     # 商品金額列の名前を変更
     if '商品金額' in df.columns:
@@ -2291,7 +2497,8 @@ def process_data_from_previews(
     shipping_request_no: str = "",
     cny_to_jpy_rate: float = 22.77,
     discount_df: pd.DataFrame = None,
-    option_distribution: Dict[str, list] = None
+    option_distribution: Dict[str, list] = None,
+    record_list_file_path: str = None
 ) -> pd.DataFrame:
     """プレビューデータから処理結果を生成"""
     
@@ -2380,7 +2587,16 @@ def process_data_from_previews(
             if shipping_request_no in email_data:
                 print(f"  email_data[{shipping_request_no}]: {email_data[shipping_request_no]}")
     
-    international_shipping_jpy = international_shipping_cny * cny_to_jpy_rate
+    # 国際送料のレートを取得（配送IDを使用）
+    if record_list_file_path and shipping_request_no:
+        international_shipping_rate = get_exchange_rate_for_shipping_and_options(
+            record_list_file_path,
+            shipping_request_no,
+            cny_to_jpy_rate
+        )
+    else:
+        international_shipping_rate = cny_to_jpy_rate
+    international_shipping_jpy = international_shipping_cny * international_shipping_rate
     
     # 第2パス: 各商品の処理
     print(f"\n=== 第2パス: 商品処理 ===")
@@ -2420,7 +2636,7 @@ def process_data_from_previews(
                 result['中国国内送料（元）'] = send_match.iloc[0].get('中国国内送料（元）', 0)
                 result['注文番号'] = send_match.iloc[0].get('注文番号', '')
                 
-                # 数量チェック: 指示書の数量とsend-order-listの1注文あたり数量を比較
+                # 数量チェック: 指示書の数量とsend-order-listの数量を比較
                 send_qty_total = send_match.iloc[0].get('数量', 0) or 0
                 send_qty_per_order = send_match.iloc[0].get('1注文あたり数量', send_qty_total) or 0
                 order_count = send_match.iloc[0].get('注文数', 1) or 1
@@ -2439,21 +2655,36 @@ def process_data_from_previews(
                     print(f"send-order-list セット数: {set_count}")
                     print(f"send-order-list 1セットあたり数量: {send_qty_per_set}")
                 
-                # 指示書の数量と1注文あたりの数量を比較
-                if abs(send_qty_per_order - fba_qty) > 0.01:  # 小数点誤差を考慮
-                    if set_count > 0:
+                # セット数が2以上の場合のみ、send-order-listの数量をセット数で割った値と指示書の数量を比較
+                # セット数が1以下の場合は、1注文あたりの数量と指示書の数量を比較
+                if set_count > 1:
+                    # セット数が2以上の場合：セット数で割った値（1セットあたり数量）と指示書の数量を比較
+                    send_qty_for_comparison = send_qty_per_set if send_qty_per_set > 0 else (send_qty_total / set_count if set_count > 0 else send_qty_per_order)
+                    print(f"比較値（1セットあたり数量）: {send_qty_for_comparison}")
+                    if abs(send_qty_for_comparison - fba_qty) > 0.01:  # 小数点誤差を考慮
                         errors.append(
                             f"⚠️ ASIN {asin} の数量が一致しません\n"
                             f"  指示書: {fba_qty}個\n"
                             f"  send-order-list: {send_qty_total}個（{order_count}注文 × {send_qty_per_order}個/注文）\n"
                             f"  セット情報: {set_count}セット × {send_qty_per_set}個/セット"
                         )
-                    else:
-                        errors.append(
-                            f"⚠️ ASIN {asin} の数量が一致しません\n"
-                            f"  指示書: {fba_qty}個\n"
-                            f"  send-order-list: {send_qty_total}個（{order_count}注文 × {send_qty_per_order}個/注文）"
-                        )
+                else:
+                    # セット数が1以下の場合：1注文あたりの数量と指示書の数量を比較
+                    print(f"比較値（1注文あたり数量）: {send_qty_per_order}")
+                    if abs(send_qty_per_order - fba_qty) > 0.01:  # 小数点誤差を考慮
+                        if set_count > 0:
+                            errors.append(
+                                f"⚠️ ASIN {asin} の数量が一致しません\n"
+                                f"  指示書: {fba_qty}個\n"
+                                f"  send-order-list: {send_qty_total}個（{order_count}注文 × {send_qty_per_order}個/注文）\n"
+                                f"  セット情報: {set_count}セット × {send_qty_per_set}個/セット"
+                            )
+                        else:
+                            errors.append(
+                                f"⚠️ ASIN {asin} の数量が一致しません\n"
+                                f"  指示書: {fba_qty}個\n"
+                                f"  send-order-list: {send_qty_total}個（{order_count}注文 × {send_qty_per_order}個/注文）"
+                            )
         
         # record-list から商品金額を取得
         if '注文番号' in result and result['注文番号'] and not record_list_df.empty and '注文番号' in record_list_df.columns:
@@ -2473,6 +2704,19 @@ def process_data_from_previews(
         # 1個あたりの計算
         qty = result.get('数量', 1) or 1
         
+        # 商品の単価のレートを取得（オーダーIDを使用）- 割引額の計算でも使用するため、先に取得
+        order_id = result.get('注文番号', '')
+        if record_list_file_path and order_id:
+            # 注文番号がカンマ区切りの場合、最初のものを使用
+            order_id_first = str(order_id).split(',')[0].strip() if order_id else ''
+            unit_price_rate = get_exchange_rate_for_unit_price(
+                record_list_file_path,
+                order_id_first,
+                cny_to_jpy_rate
+            )
+        else:
+            unit_price_rate = cny_to_jpy_rate
+        
         # 中国国内送料（元）はsend-order-listから既に取得済み
         domestic_shipping_cny = result.get('中国国内送料（元）', 0) or 0
         
@@ -2480,11 +2724,18 @@ def process_data_from_previews(
         volume = product_volumes.get(asin, 0)
         result['体積(cm3)'] = volume
         
+        # 国際送料の按分計算に必要な情報を保存（表示用）
+        result['国際送料（元・総額）'] = international_shipping_cny
+        result['国際送料用為替レート'] = international_shipping_rate
+        result['国際送料（円・総額）'] = international_shipping_jpy
+        result['総体積(cm3)'] = total_volume
+        result['按分比率'] = volume / total_volume if total_volume > 0 else 0
+        
         if volume > 0 and total_volume > 0:
             # 商品1個あたりの国際送料（円） = 国際送料（円） × (商品1個の体積 / 総体積)
             result['商品1個あたり国際送料（円）'] = international_shipping_jpy * (volume / total_volume)
-            # 元に変換（表示用）
-            result['商品1個あたり国際送料（元）'] = result['商品1個あたり国際送料（円）'] / cny_to_jpy_rate
+            # 元に変換（表示用）- 国際送料のレートを使用
+            result['商品1個あたり国際送料（元）'] = result['商品1個あたり国際送料（円）'] / international_shipping_rate if international_shipping_rate > 0 else 0
             
             # デバッグ情報
             print(f"ASIN {asin}:")
@@ -2526,9 +2777,10 @@ def process_data_from_previews(
             print(f"Total discount (CNY): {total_discount_cny}")
             
             # 商品1個あたりの割引額（円） = 割引額（元） × 元→円レート / 数量
+            # 割引額は商品の単価と同じレートを使用
             if qty > 0:
-                result['商品1個につき割引額（円）'] = (total_discount_cny * cny_to_jpy_rate) / qty
-                result['商品1個につき割引額（元）'] = result['商品1個につき割引額（円）'] / cny_to_jpy_rate
+                result['商品1個につき割引額（円）'] = (total_discount_cny * unit_price_rate) / qty
+                result['商品1個につき割引額（元）'] = result['商品1個につき割引額（円）'] / unit_price_rate if unit_price_rate > 0 else 0
                 print(f"商品1個につき割引額（円）: {result['商品1個につき割引額（円）']}")
             else:
                 result['商品1個につき割引額（円）'] = 0
@@ -2550,7 +2802,16 @@ def process_data_from_previews(
                 print(f"指示書のL列からオプション費用: {base_option_fee_cny}元")
         
         # 基本オプション費用を円に換算して1個あたりに計算
-        base_option_fee_jpy = base_option_fee_cny * cny_to_jpy_rate
+        # オプション費用のレートを取得（配送IDを使用）
+        if record_list_file_path and shipping_request_no:
+            option_rate = get_exchange_rate_for_shipping_and_options(
+                record_list_file_path,
+                shipping_request_no,
+                cny_to_jpy_rate
+            )
+        else:
+            option_rate = cny_to_jpy_rate
+        base_option_fee_jpy = base_option_fee_cny * option_rate
         base_option_fee_per_item_jpy = base_option_fee_jpy / qty if qty > 0 else 0
         print(f"基本オプション費用（1個あたり・円）: {base_option_fee_per_item_jpy}")
         
@@ -2588,7 +2849,7 @@ def process_data_from_previews(
                     # 手動分配情報の形式
                     if dist.get('asin', '') == asin:
                         dist_amount_cny = dist.get('amount', 0)
-                        dist_amount_jpy = dist_amount_cny * cny_to_jpy_rate
+                        dist_amount_jpy = dist_amount_cny * option_rate
                         # そのASINの数量で割る
                         dist_per_item = dist_amount_jpy / qty if qty > 0 else 0
                         additional_option_fee_jpy += dist_per_item
@@ -2599,7 +2860,7 @@ def process_data_from_previews(
                     if asin in dist['ASINs']:
                         # この配分がこのASINに適用される
                         dist_amount_cny = dist['金額（元）']
-                        dist_amount_jpy = dist_amount_cny * cny_to_jpy_rate
+                        dist_amount_jpy = dist_amount_cny * option_rate
                         # 配分先ASINの数で割る
                         num_target_asins = len(dist['ASINs'])
                         if num_target_asins > 0:
@@ -2618,7 +2879,7 @@ def process_data_from_previews(
                 if total_qty_all_asins > 0:
                     # 差額を全ASINの数量合計で割って、さらにこのASINの数量で割る
                     difference_per_item_cny = option_difference_cny / total_qty_all_asins
-                    difference_per_item_jpy = difference_per_item_cny * cny_to_jpy_rate
+                    difference_per_item_jpy = difference_per_item_cny * option_rate
                     additional_option_fee_jpy = difference_per_item_jpy
                     print(f"追加配分（自動・差額均等配分）: {difference_per_item_jpy}円/個 (元: {difference_per_item_cny}元)")
             else:
@@ -2627,14 +2888,14 @@ def process_data_from_previews(
                 total_qty_all_asins = fba_df['数量'].sum() if '数量' in fba_df.columns else 0
                 if total_qty_all_asins > 0:
                     difference_per_item_cny = option_difference_cny / total_qty_all_asins
-                    difference_per_item_jpy = difference_per_item_cny * cny_to_jpy_rate
+                    difference_per_item_jpy = difference_per_item_cny * option_rate
                     additional_option_fee_jpy = difference_per_item_jpy
                     print(f"追加配分（自動・差額均等配分）: {difference_per_item_jpy}円/個 (元: {difference_per_item_cny}元)")
         
         # 合計オプション費用 = 指示書の基本オプション費用 + 差額による追加オプション費用
         total_option_fee_per_item_jpy = base_option_fee_per_item_jpy + additional_option_fee_jpy
         result['商品1個あたりのオプション費用（円）'] = total_option_fee_per_item_jpy
-        result['商品1個あたりのオプション費用（元）'] = total_option_fee_per_item_jpy / cny_to_jpy_rate if cny_to_jpy_rate > 0 else 0
+        result['商品1個あたりのオプション費用（元）'] = total_option_fee_per_item_jpy / option_rate if option_rate > 0 else 0
         print(f"合計オプション費用（1個あたり・円）: {total_option_fee_per_item_jpy}")
         
         # 税金を数量の比率で按分
@@ -2658,11 +2919,25 @@ def process_data_from_previews(
         
         # 原価の計算
         unit_price_cny = result.get('購入単価（元）', 0) or 0
-        unit_price_jpy = unit_price_cny * cny_to_jpy_rate
+        # unit_price_rateは既に上で取得済み
+        unit_price_jpy = unit_price_cny * unit_price_rate
+        # 購入単価（円）をresultに保存（表示用）
+        result['購入単価（円）'] = unit_price_jpy
         
         # 中国国内送料（元）を円に変換して数量で割って1個あたりに
-        domestic_shipping_jpy = domestic_shipping_cny * cny_to_jpy_rate
+        # 中国国内送料・オプション費用・国際送料のレートを取得（配送IDを使用）
+        if record_list_file_path and shipping_request_no:
+            shipping_rate = get_exchange_rate_for_shipping_and_options(
+                record_list_file_path,
+                shipping_request_no,
+                cny_to_jpy_rate
+            )
+        else:
+            shipping_rate = cny_to_jpy_rate
+        domestic_shipping_jpy = domestic_shipping_cny * shipping_rate
         domestic_shipping_per_item = domestic_shipping_jpy / qty if qty > 0 else 0
+        # 中国国内送料（円・1個あたり）をresultに保存（表示用）
+        result['中国国内送料（円・1個あたり）'] = domestic_shipping_per_item
         
         result['原価(円)'] = (
             unit_price_jpy +
@@ -3142,6 +3417,8 @@ def main():
             import pandas as pd
             send_order_matches = pd.DataFrame()
             send_order_asins = []
+            send_order_detail_df = pd.DataFrame()  # send_orderのプレビューデータを保存（record_listとの比較用）
+            send_order_detail_df = pd.DataFrame()  # send_orderのプレビューデータを保存
             
             # ファイル処理順序を定義（個別アップロードと同じ順序に統一）
             # FBA指示書、send-order-list、record-list、jancode-listの順序
@@ -3185,6 +3462,8 @@ def main():
                 
                 if file_type == 'send_order' and asins:
                     detail_df = get_send_order_preview(asins, file_path)
+                    # send_orderのプレビューデータを保存（record_listとの比較用）
+                    send_order_detail_df = detail_df.copy()
                     if not detail_df.empty:
                         st.subheader("📄 send_orderのプレビュー")
                         
@@ -3587,6 +3866,94 @@ def main():
                             
                             st.dataframe(record_df[display_cols], width='stretch', height=200)
                             
+                            # send_orderの「単価（元）」とrecord_listの「価格（price）」の比較
+                            if not send_order_detail_df.empty and '価格（price）' in record_df.columns and '単価（元）' in send_order_detail_df.columns:
+                                st.markdown("---")
+                                st.subheader("💰 単価（元）と価格（price）の突合チェック")
+                                st.caption("send_orderの「単価（元）」とrecord_listの「価格（price）」を比較")
+                                
+                                # 比較結果を格納
+                                price_comparison_results = []
+                                
+                                # record_listの各注文番号について比較
+                                if '注文番号' in record_df.columns:
+                                    for _, record_row in record_df.iterrows():
+                                        order_no = str(record_row['注文番号']).strip()
+                                        record_price_raw = record_row.get('価格（price）', None)
+                                        
+                                        if record_price_raw is None or pd.isna(record_price_raw):
+                                            continue
+                                        
+                                        try:
+                                            record_price = float(record_price_raw)
+                                        except (ValueError, TypeError):
+                                            continue
+                                        
+                                        # send_orderから該当する注文番号を検索
+                                        # detail_dfには既に「単価（元）」が含まれている
+                                        send_order_matches_price = send_order_detail_df[
+                                            send_order_detail_df['注文番号'].astype(str).str.contains(order_no, na=False, regex=False)
+                                        ]
+                                        
+                                        if not send_order_matches_price.empty:
+                                            # 各マッチについて比較
+                                            for _, send_row in send_order_matches_price.iterrows():
+                                                send_order_no = str(send_row['注文番号']).strip()
+                                                # カンマ区切りの注文番号から該当するものを抽出
+                                                order_nos_in_cell = [o.strip() for o in str(send_order_no).split(',') if o.strip()]
+                                                
+                                                if order_no in order_nos_in_cell or send_order_no == order_no:
+                                                    send_price = send_row.get('単価（元）', 0) or 0
+                                                    try:
+                                                        send_price = float(send_price)
+                                                    except (ValueError, TypeError):
+                                                        send_price = 0
+                                                    
+                                                    # 差額を計算
+                                                    difference = abs(send_price - record_price)
+                                                    tolerance = 0.01  # 0.01元以下の差は一致とみなす
+                                                    
+                                                    # ASINを取得
+                                                    asin = send_row.get('ASIN', '') if 'ASIN' in send_row else ''
+                                                    
+                                                    price_comparison_results.append({
+                                                        '注文番号': order_no,
+                                                        'ASIN': asin,
+                                                        'send_order単価（元）': send_price,
+                                                        'record_list価格（price）': record_price,
+                                                        '差額（元）': difference,
+                                                        '一致': difference <= tolerance
+                                                    })
+                                    
+                                    if price_comparison_results:
+                                        comparison_df_price = pd.DataFrame(price_comparison_results)
+                                        
+                                        # 一致と不一致に分ける
+                                        matched_price = comparison_df_price[comparison_df_price['一致'] == True]
+                                        mismatched_price = comparison_df_price[comparison_df_price['一致'] == False]
+                                        
+                                        if len(matched_price) > 0:
+                                            st.success(f"✅ **一致**: {len(matched_price)}件の注文番号で単価が一致しています")
+                                        
+                                        if len(mismatched_price) > 0:
+                                            st.warning(f"⚠️ **不一致**: {len(mismatched_price)}件の注文番号で単価が一致しません")
+                                            
+                                            # 不一致の詳細を表示
+                                            display_cols_price = ['注文番号', 'ASIN', 'send_order単価（元）', 'record_list価格（price）', '差額（元）']
+                                            display_cols_price = [col for col in display_cols_price if col in mismatched_price.columns]
+                                            mismatched_display_price = mismatched_price[display_cols_price].copy()
+                                            
+                                            # 数値列をフォーマット
+                                            for col in ['send_order単価（元）', 'record_list価格（price）', '差額（元）']:
+                                                if col in mismatched_display_price.columns:
+                                                    mismatched_display_price[col] = mismatched_display_price[col].apply(lambda x: f"{x:,.2f}" if pd.notna(x) else '')
+                                            
+                                            st.dataframe(mismatched_display_price, width='stretch', hide_index=True)
+                                        elif len(price_comparison_results) > 0:
+                                            st.info("💡 すべての注文番号で単価が一致しています")
+                                    else:
+                                        st.info("💡 比較対象のデータが見つかりませんでした")
+                            
                             # send_orderとrecord_listの商品金額（元）の突合チェック
                             if 'send_order' in st.session_state.uploaded_files and not record_df.empty:
                                 st.markdown("---")
@@ -3795,6 +4162,62 @@ def main():
                                     total = (email_data.get('国際送料', 0) + email_data.get('オプション料金', 0) + 
                                             email_data.get('通関手数料', 0) + email_data.get('中国国内送料', 0))
                                     st.info(f"**合計:** {total:,.2f} 元")
+                                    
+                                    # 国際送料の突合チェック（record-listとメールの比較）
+                                    st.markdown("---")
+                                    st.subheader("✈️ 国際送料の突合チェック")
+                                    email_international_shipping = email_data.get('国際送料', 0) or 0
+                                    
+                                    if 'record_list' in st.session_state.uploaded_files and shipping_request_no:
+                                        record_list_file_path = st.session_state.uploaded_files['record_list']
+                                        record_list_international_shipping = get_international_shipping_from_record_list(
+                                            record_list_file_path,
+                                            shipping_request_no
+                                        )
+                                        
+                                        if record_list_international_shipping is not None:
+                                            # 差額を計算（小数点以下の誤差を考慮）
+                                            difference = abs(email_international_shipping - record_list_international_shipping)
+                                            tolerance = 0.01  # 0.01元以下の差は一致とみなす
+                                            
+                                            if difference <= tolerance:
+                                                st.success(f"✅ **一致**: メールとrecord-listの国際送料が一致しています")
+                                                st.caption(f"メール: {email_international_shipping:,.2f} 元 | record-list: {record_list_international_shipping:,.2f} 元")
+                                            else:
+                                                st.warning(f"⚠️ **不一致**: メールとrecord-listの国際送料に差があります")
+                                                
+                                                col1, col2, col3 = st.columns(3)
+                                                with col1:
+                                                    st.metric("メールの国際送料", f"{email_international_shipping:,.2f} 元")
+                                                with col2:
+                                                    st.metric("record-listの国際送料", f"{record_list_international_shipping:,.2f} 元")
+                                                with col3:
+                                                    delta_value = record_list_international_shipping - email_international_shipping
+                                                    delta_label = "差額"
+                                                    st.metric(
+                                                        delta_label,
+                                                        f"{difference:,.2f} 元",
+                                                        delta=f"{delta_value:,.2f} 元" if delta_value != 0 else None
+                                                    )
+                                        else:
+                                            # record-listから取得できない場合でも、メールの国際送料を表示
+                                            col1, col2 = st.columns(2)
+                                            with col1:
+                                                st.metric("メールの国際送料", f"{email_international_shipping:,.2f} 元")
+                                            with col2:
+                                                st.metric("record-listの国際送料", "見つかりません")
+                                            st.info("💡 record-listから国際送料を取得できませんでした。配送ID列または配送依頼番号に一致する行が見つかりませんでした。")
+                                    else:
+                                        # record-listファイルがない場合でも、メールの国際送料を表示
+                                        col1, col2 = st.columns(2)
+                                        with col1:
+                                            st.metric("メールの国際送料", f"{email_international_shipping:,.2f} 元")
+                                        with col2:
+                                            st.metric("record-listの国際送料", "見つかりません")
+                                        if not shipping_request_no:
+                                            st.info("💡 配送依頼番号が設定されていません。")
+                                        elif 'record_list' not in st.session_state.uploaded_files:
+                                            st.info("💡 record-listファイルがアップロードされていません。")
                                     
                                     # オプション費用の突合チェック
                                     instruction_option_cost = st.session_state.get('instruction_total_option_cost', 0)
@@ -4074,6 +4497,62 @@ def main():
                                 total = (email_data.get('国際送料', 0) + email_data.get('オプション料金', 0) + 
                                         email_data.get('通関手数料', 0) + email_data.get('中国国内送料', 0))
                                 st.info(f"**合計:** {total:,.2f} 元")
+                                
+                                # 国際送料の突合チェック（record-listとメールの比較）
+                                st.markdown("---")
+                                st.subheader("✈️ 国際送料の突合チェック")
+                                email_international_shipping = email_data.get('国際送料', 0) or 0
+                                
+                                if 'record_list' in st.session_state.uploaded_files and shipping_request_no:
+                                    record_list_file_path = st.session_state.uploaded_files['record_list']
+                                    record_list_international_shipping = get_international_shipping_from_record_list(
+                                        record_list_file_path,
+                                        shipping_request_no
+                                    )
+                                    
+                                    if record_list_international_shipping is not None:
+                                        # 差額を計算（小数点以下の誤差を考慮）
+                                        difference = abs(email_international_shipping - record_list_international_shipping)
+                                        tolerance = 0.01  # 0.01元以下の差は一致とみなす
+                                        
+                                        if difference <= tolerance:
+                                            st.success(f"✅ **一致**: メールとrecord-listの国際送料が一致しています")
+                                            st.caption(f"メール: {email_international_shipping:,.2f} 元 | record-list: {record_list_international_shipping:,.2f} 元")
+                                        else:
+                                            st.warning(f"⚠️ **不一致**: メールとrecord-listの国際送料に差があります")
+                                            
+                                            col1, col2, col3 = st.columns(3)
+                                            with col1:
+                                                st.metric("メールの国際送料", f"{email_international_shipping:,.2f} 元")
+                                            with col2:
+                                                st.metric("record-listの国際送料", f"{record_list_international_shipping:,.2f} 元")
+                                            with col3:
+                                                delta_value = record_list_international_shipping - email_international_shipping
+                                                delta_label = "差額"
+                                                st.metric(
+                                                    delta_label,
+                                                    f"{difference:,.2f} 元",
+                                                    delta=f"{delta_value:,.2f} 元" if delta_value != 0 else None
+                                                )
+                                    else:
+                                        # record-listから取得できない場合でも、メールの国際送料を表示
+                                        col1, col2 = st.columns(2)
+                                        with col1:
+                                            st.metric("メールの国際送料", f"{email_international_shipping:,.2f} 元")
+                                        with col2:
+                                            st.metric("record-listの国際送料", "見つかりません")
+                                        st.info("💡 record-listから国際送料を取得できませんでした。配送ID列または配送依頼番号に一致する行が見つかりませんでした。")
+                                else:
+                                    # record-listファイルがない場合でも、メールの国際送料を表示
+                                    col1, col2 = st.columns(2)
+                                    with col1:
+                                        st.metric("メールの国際送料", f"{email_international_shipping:,.2f} 元")
+                                    with col2:
+                                        st.metric("record-listの国際送料", "見つかりません")
+                                    if not shipping_request_no:
+                                        st.info("💡 配送依頼番号が設定されていません。")
+                                    elif 'record_list' not in st.session_state.uploaded_files:
+                                        st.info("💡 record-listファイルがアップロードされていません。")
                                 
                                 # オプション費用の突合チェック
                                 instruction_option_cost = st.session_state.get('instruction_total_option_cost', 0)
@@ -4466,6 +4945,9 @@ def main():
                                 
                                 st.info(f"💡 手動分配情報を読み込みました: {len(manual_distribution[distribution_key])}件")
                         
+                        # record_listファイルパスを取得
+                        record_list_file_path = st.session_state.uploaded_files.get('record_list', None)
+                        
                         results_df = process_data_from_previews(
                             fba_df,
                             jancode_df,
@@ -4476,7 +4958,8 @@ def main():
                             shipping_request_no,
                             cny_to_jpy_rate,
                             discount_df,
-                            option_distribution
+                            option_distribution,
+                            record_list_file_path
                         )
                         
                         progress_bar.progress(100)
@@ -4671,7 +5154,7 @@ def main():
                     # 選択されたASINのデータを取得
                     selected_row = display_df[display_df['ASIN'] == selected_asin].iloc[0]
                     
-                    # 各コンポーネントを取得
+                    # 各コンポーネントを取得（実際に計算された値を使用）
                     unit_price_cny = selected_row.get('購入単価（元）', 0) or 0
                     domestic_shipping_cny = selected_row.get('中国国内送料（元）', 0) or 0
                     qty = selected_row.get('数量', 1) or 1
@@ -4680,12 +5163,24 @@ def main():
                     customs_jpy = selected_row.get('商品1個あたり関税（円）', 0) or 0
                     actual_cost = selected_row.get('原価(円)', 0) or 0
                     
-                    # 為替レートを取得（session_stateから）
+                    # 実際に計算された値を使用（異なる為替レートが適用されているため）
+                    unit_price_jpy = selected_row.get('購入単価（円）', 0) or 0
+                    domestic_shipping_per_item_jpy = selected_row.get('中国国内送料（円・1個あたり）', 0) or 0
+                    
+                    # 国際送料の按分計算に必要な情報を取得
+                    international_shipping_cny_total = selected_row.get('国際送料（元・総額）', 0) or 0
+                    international_shipping_rate = selected_row.get('国際送料用為替レート', 0) or 0
+                    international_shipping_jpy_total = selected_row.get('国際送料（円・総額）', 0) or 0
+                    volume = selected_row.get('体積(cm3)', 0) or 0
+                    total_volume = selected_row.get('総体積(cm3)', 0) or 0
+                    allocation_ratio = selected_row.get('按分比率', 0) or 0
+                    
+                    # 為替レートを取得（表示用の参考値として）
                     cny_to_jpy_rate = st.session_state.get('cny_to_jpy_rate', 22.77)
                     
-                    # 各項目を計算
-                    unit_price_jpy = unit_price_cny * cny_to_jpy_rate
-                    domestic_shipping_per_item_jpy = (domestic_shipping_cny * cny_to_jpy_rate) / qty if qty > 0 else 0
+                    # 実際に使用された為替レートを推定（表示用）
+                    unit_price_rate = unit_price_jpy / unit_price_cny if unit_price_cny > 0 else cny_to_jpy_rate
+                    domestic_shipping_rate = (domestic_shipping_per_item_jpy * qty) / domestic_shipping_cny if domestic_shipping_cny > 0 else cny_to_jpy_rate
                     
                     # 計算結果を表示
                     st.markdown(f"""
@@ -4708,14 +5203,14 @@ def main():
                             "title": "①購入単価",
                             "value_cny": unit_price_cny,
                             "value_jpy": unit_price_jpy,
-                            "formula": f"{unit_price_cny:,.2f}元 × {cny_to_jpy_rate}",
+                            "formula": f"{unit_price_cny:,.2f}元 × {unit_price_rate:.2f}",
                             "icon": "💰"
                         },
                         {
                             "title": "②中国国内送料",
                             "value_cny": domestic_shipping_cny / qty if qty > 0 else 0,
                             "value_jpy": domestic_shipping_per_item_jpy,
-                            "formula": f"{domestic_shipping_cny:,.2f}元 ÷ {qty:,.0f} × {cny_to_jpy_rate}",
+                            "formula": f"{domestic_shipping_cny:,.2f}元 ÷ {qty:,.0f} × {domestic_shipping_rate:.2f}",
                             "icon": "🚚"
                         },
                         {
@@ -4727,10 +5222,19 @@ def main():
                         },
                         {
                             "title": "④国際送料",
-                            "value_cny": international_shipping_jpy / cny_to_jpy_rate if cny_to_jpy_rate > 0 else 0,
+                            "value_cny": international_shipping_jpy / international_shipping_rate if international_shipping_rate > 0 else 0,
                             "value_jpy": international_shipping_jpy,
-                            "formula": "体積按分",
-                            "icon": "✈️"
+                            "formula": f"{international_shipping_cny_total:,.2f}元 × {international_shipping_rate:.2f} × ({volume:,.0f}cm³ ÷ {total_volume:,.0f}cm³) = {international_shipping_jpy:,.2f}円" if total_volume > 0 and international_shipping_rate > 0 else "体積按分",
+                            "icon": "✈️",
+                            "detail": {
+                                "国際送料（元・総額）": international_shipping_cny_total,
+                                "為替レート": international_shipping_rate,
+                                "国際送料（円・総額）": international_shipping_jpy_total,
+                                "この商品の体積": volume,
+                                "総体積": total_volume,
+                                "按分比率": allocation_ratio,
+                                "商品1個あたり国際送料（円）": international_shipping_jpy
+                            } if total_volume > 0 else None
                         },
                         {
                             "title": "⑤関税",
@@ -4753,6 +5257,49 @@ def main():
                             """, unsafe_allow_html=True)
                     
                     st.markdown("<br>", unsafe_allow_html=True)
+                    
+                    # 国際送料の按分計算の詳細を表示
+                    if total_volume > 0 and international_shipping_rate > 0:
+                        st.markdown("---")
+                        st.markdown("### ✈️ 国際送料の按分計算詳細")
+                        st.markdown(f"""
+                        <div style="padding: 20px; background: linear-gradient(135deg, #F0F9FF 0%, #E0F2FE 100%); border-radius: 12px; border: 2px solid #0EA5E9;">
+                            <h4 style="color: #0C4A6E; margin-bottom: 15px;">📊 体積按分の計算過程</h4>
+                            <div style="background-color: #FFF; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                                <div style="font-size: 11px; color: #6B7280; margin-bottom: 10px;"><strong>ステップ1: 国際送料（元）を円に変換</strong></div>
+                                <div style="font-size: 12px; color: #2E5266; line-height: 1.8;">
+                                    国際送料（元・総額）: {international_shipping_cny_total:,.2f} 元<br>
+                                    × 為替レート: {international_shipping_rate:.2f} 円/元<br>
+                                    = <strong>国際送料（円・総額）: {international_shipping_jpy_total:,.2f} 円</strong>
+                                </div>
+                            </div>
+                            <div style="background-color: #FFF; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                                <div style="font-size: 11px; color: #6B7280; margin-bottom: 10px;"><strong>ステップ2: 体積比率を計算</strong></div>
+                                <div style="font-size: 12px; color: #2E5266; line-height: 1.8;">
+                                    この商品の体積（1個あたり）: {volume:,.0f} cm³<br>
+                                    ÷ 総体積（全商品合計）: {total_volume:,.0f} cm³<br>
+                                    = <strong>按分比率: {allocation_ratio:.4f} ({allocation_ratio*100:.2f}%)</strong>
+                                </div>
+                            </div>
+                            <div style="background-color: #FFF; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                                <div style="font-size: 11px; color: #6B7280; margin-bottom: 10px;"><strong>ステップ3: 商品1個あたりの国際送料を計算</strong></div>
+                                <div style="font-size: 12px; color: #2E5266; line-height: 1.8;">
+                                    国際送料（円・総額）: {international_shipping_jpy_total:,.2f} 円<br>
+                                    × 按分比率: {allocation_ratio:.4f}<br>
+                                    = <strong>商品1個あたり国際送料（円）: {international_shipping_jpy:,.2f} 円</strong>
+                                </div>
+                            </div>
+                            <div style="background-color: #E0F2FE; padding: 15px; border-radius: 8px; border-left: 4px solid #0EA5E9;">
+                                <div style="font-size: 11px; color: #0C4A6E; font-weight: 600; margin-bottom: 5px;">📐 計算式（まとめ）</div>
+                                <div style="font-size: 11px; color: #0C4A6E; font-family: monospace; line-height: 1.6;">
+                                    {international_shipping_cny_total:,.2f}元 × {international_shipping_rate:.2f} × ({volume:,.0f}cm³ ÷ {total_volume:,.0f}cm³)<br>
+                                    = {international_shipping_jpy_total:,.2f}円 × {allocation_ratio:.4f}<br>
+                                    = <strong>{international_shipping_jpy:,.2f}円</strong>
+                                </div>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        st.markdown("<br>", unsafe_allow_html=True)
                     
                     # 計算式と結果
                     calculated_cost = (
