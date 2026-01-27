@@ -2487,6 +2487,90 @@ def display_file_info(file_info_dict):
                 st.warning("未読み込み")
             st.markdown('</div>', unsafe_allow_html=True)
 
+def get_size_category(length: float, width: float, height: float) -> str:
+    """
+    サイズ区分を判定
+    配送代行手数料表の条件に基づいて判定
+    """
+    if length <= 0 or width <= 0 or height <= 0:
+        return "不明"
+    
+    max_dimension = max(length, width, height)
+    sum_dimensions = length + width + height
+    
+    # 小型: 25×18×2cm以下
+    if max_dimension <= 25 and sum_dimensions <= 45:  # 25+18+2=45
+        return "小型"
+    
+    # 標準1: 35×30×3.3cm以下
+    if max_dimension <= 35 and sum_dimensions <= 68.3:  # 35+30+3.3=68.3
+        return "標準1"
+    
+    # 標準2a: 20cm以下
+    if max_dimension <= 20:
+        return "標準2a"
+    
+    # 標準2b: 30cm以下
+    if max_dimension <= 30:
+        return "標準2b"
+    
+    # 標準2c: 40cm以下
+    if max_dimension <= 40:
+        return "標準2c"
+    
+    # 標準2d: 50cm以下
+    if max_dimension <= 50:
+        return "標準2d"
+    
+    # 標準2e: 60cm以下
+    if max_dimension <= 60:
+        return "標準2e"
+    
+    # 標準3: 80cm以下
+    if max_dimension <= 80:
+        return "標準3"
+    
+    # 標準4: 100cm以下
+    if max_dimension <= 100:
+        return "標準4"
+    
+    # それ以上は大型
+    return "大型"
+
+
+def get_shipping_agent_fee(size_category: str, unit_price_jpy: float, shipping_fee_table: pd.DataFrame = None) -> float:
+    """
+    配送代行手数料を取得
+    サイズ区分と価格に基づいて料金を返す
+    """
+    if shipping_fee_table is None or shipping_fee_table.empty:
+        # デフォルト値（フォールバック）
+        default_fees = {
+            "小型": 252 if unit_price_jpy <= 1000 else 288,
+            "標準1": 252 if unit_price_jpy <= 1000 else 318,
+            "標準2a": 347 if unit_price_jpy <= 1000 else 413,
+            "標準2b": 368 if unit_price_jpy <= 1000 else 434,
+            "標準2c": 389 if unit_price_jpy <= 1000 else 455,
+            "標準2d": 399 if unit_price_jpy <= 1000 else 465,
+            "標準2e": 419 if unit_price_jpy <= 1000 else 485,
+            "標準3": 448 if unit_price_jpy <= 1000 else 514,
+            "標準4": 466 if unit_price_jpy <= 1000 else 532,
+        }
+        return default_fees.get(size_category, 0)
+    
+    # 配送代行手数料表から取得
+    fee_row = shipping_fee_table[shipping_fee_table['サイズ区分'] == size_category]
+    if not fee_row.empty:
+        # 価格に応じて料金を選択
+        if unit_price_jpy > 1000:
+            fee = fee_row.iloc[0].get('価格>1000円', 0)
+        else:
+            fee = fee_row.iloc[0].get('価格≤1000円', 0)
+        return float(fee) if pd.notna(fee) else 0
+    
+    return 0
+
+
 def process_data_from_previews(
     fba_df: pd.DataFrame,
     jancode_df: pd.DataFrame,
@@ -2498,7 +2582,8 @@ def process_data_from_previews(
     cny_to_jpy_rate: float = 22.77,
     discount_df: pd.DataFrame = None,
     option_distribution: Dict[str, list] = None,
-    record_list_file_path: str = None
+    record_list_file_path: str = None,
+    shipping_fee_table: pd.DataFrame = None
 ) -> pd.DataFrame:
     """プレビューデータから処理結果を生成"""
     
@@ -2947,9 +3032,49 @@ def process_data_from_previews(
             result.get('商品1個あたり関税（円）', 0)
         )
         
-        results.append(result)
+        # サイズ区分と配送代行手数料を計算
+        length = result.get('長さ(cm)', 0) or 0
+        width = result.get('幅(cm)', 0) or 0
+        height = result.get('高さ(cm)', 0) or 0
+        
+        size_category = get_size_category(length, width, height)
+        result['サイズ区分'] = size_category
+        
+        # 配送代行手数料を計算（shipping_fee_tableはパラメータとして渡される）
+        shipping_agent_fee = get_shipping_agent_fee(size_category, unit_price_jpy, shipping_fee_table)
+        result['配送代行手数料（円）'] = shipping_agent_fee
+        
+        print(f"ASIN {asin}: サイズ区分={size_category}, 配送代行手数料={shipping_agent_fee}円")
+        
+        # result辞書のコピーを作成してから追加（念のため）
+        result_copy = result.copy()
+        results.append(result_copy)
+        
+        # デバッグ: 追加したresultの内容を確認
+        if 'サイズ区分' in result_copy:
+            print(f"  ✅ resultに'サイズ区分'が含まれています: {result_copy['サイズ区分']}")
+        else:
+            print(f"  ❌ resultに'サイズ区分'が含まれていません")
+        if '配送代行手数料（円）' in result_copy:
+            print(f"  ✅ resultに'配送代行手数料（円）'が含まれています: {result_copy['配送代行手数料（円）']}")
+        else:
+            print(f"  ❌ resultに'配送代行手数料（円）'が含まれていません")
     
     result_df = pd.DataFrame(results)
+    
+    # デバッグ: 結果の列を確認
+    print(f"\n=== 処理結果の列確認 ===")
+    print(f"result_df columns: {result_df.columns.tolist()}")
+    if 'サイズ区分' in result_df.columns:
+        print(f"✅ 'サイズ区分'列が存在します")
+        print(f"   サンプル値: {result_df['サイズ区分'].head().tolist()}")
+    else:
+        print(f"❌ 'サイズ区分'列が存在しません")
+    if '配送代行手数料（円）' in result_df.columns:
+        print(f"✅ '配送代行手数料（円）'列が存在します")
+        print(f"   サンプル値: {result_df['配送代行手数料（円）'].head().tolist()}")
+    else:
+        print(f"❌ '配送代行手数料（円）'列が存在しません")
     
     # エラーがある場合は警告として表示（呼び出し元で処理）
     if errors:
@@ -3458,6 +3583,64 @@ def main():
                         styled_jancode = styled_jancode.format(format_dict, na_rep='-')
                         
                         st.dataframe(styled_jancode, width='stretch', height=250)
+                        
+                        # 配送代行手数料表を表示（jancodeプレビューの下）
+                        st.markdown("---")
+                        st.subheader("🚚 配送代行手数料表")
+                        
+                        # セッション状態に配送代行手数料表を初期化
+                        if 'shipping_fee_table' not in st.session_state:
+                            shipping_fee_table_data = [
+                                {"サイズ区分": "小型", "サイズ条件": "25×18×2cm以下", "価格>1000円": 288, "価格≤1000円": 252},
+                                {"サイズ区分": "標準1", "サイズ条件": "35×30×3.3cm以下", "価格>1000円": 318, "価格≤1000円": 252},
+                                {"サイズ区分": "標準2a", "サイズ条件": "20cm以下", "価格>1000円": 413, "価格≤1000円": 347},
+                                {"サイズ区分": "標準2b", "サイズ条件": "30cm以下", "価格>1000円": 434, "価格≤1000円": 368},
+                                {"サイズ区分": "標準2c", "サイズ条件": "40cm以下", "価格>1000円": 455, "価格≤1000円": 389},
+                                {"サイズ区分": "標準2d", "サイズ条件": "50cm以下", "価格>1000円": 465, "価格≤1000円": 399},
+                                {"サイズ区分": "標準2e", "サイズ条件": "60cm以下", "価格>1000円": 485, "価格≤1000円": 419},
+                                {"サイズ区分": "標準3", "サイズ条件": "80cm以下", "価格>1000円": 514, "価格≤1000円": 448},
+                                {"サイズ区分": "標準4", "サイズ条件": "100cm以下", "価格>1000円": 532, "価格≤1000円": 466},
+                            ]
+                            st.session_state.shipping_fee_table = pd.DataFrame(shipping_fee_table_data)
+                        
+                        # 編集可能なデータエディタで表示
+                        edited_shipping_fee = st.data_editor(
+                            st.session_state.shipping_fee_table,
+                            use_container_width=True,
+                            hide_index=True,
+                            num_rows="fixed",
+                            column_config={
+                                "サイズ区分": st.column_config.TextColumn(
+                                    "サイズ区分",
+                                    width="small",
+                                    disabled=True  # サイズ区分は編集不可
+                                ),
+                                "サイズ条件": st.column_config.TextColumn(
+                                    "サイズ条件",
+                                    width="medium"
+                                ),
+                                "価格>1000円": st.column_config.NumberColumn(
+                                    "価格>1000円 (¥)",
+                                    width="small",
+                                    min_value=0,
+                                    format="%d"
+                                ),
+                                "価格≤1000円": st.column_config.NumberColumn(
+                                    "価格≤1000円 (¥)",
+                                    width="small",
+                                    min_value=0,
+                                    format="%d"
+                                )
+                            }
+                        )
+                        
+                        # 変更があった場合はセッション状態を更新
+                        if not edited_shipping_fee.equals(st.session_state.shipping_fee_table):
+                            st.session_state.shipping_fee_table = edited_shipping_fee
+                            st.success("✅ 配送代行手数料表を更新しました")
+                        
+                        st.caption("💡 配送代行手数料は商品の価格とサイズ区分に基づいて決定されます。表の内容を編集できます。")
+                        st.markdown("---")
                     continue  # display_data_preview をスキップ
                 
                 if file_type == 'send_order' and asins:
@@ -4948,6 +5131,9 @@ def main():
                         # record_listファイルパスを取得
                         record_list_file_path = st.session_state.uploaded_files.get('record_list', None)
                         
+                        # 配送代行手数料表を取得
+                        shipping_fee_table = st.session_state.get('shipping_fee_table', None)
+                        
                         results_df = process_data_from_previews(
                             fba_df,
                             jancode_df,
@@ -4959,7 +5145,8 @@ def main():
                             cny_to_jpy_rate,
                             discount_df,
                             option_distribution,
-                            record_list_file_path
+                            record_list_file_path,
+                            shipping_fee_table
                         )
                         
                         progress_bar.progress(100)
@@ -5060,6 +5247,8 @@ def main():
                 '商品1個あたり国際送料（円）',
                 '商品1個あたり国際送料（元）',
                 '商品1個あたり関税（円）',
+                '配送代行手数料（円）',
+                'サイズ区分',
                 '商品1個あたり消費税（円）',
                 '商品1個あたり地方消費税（円）'
             ]
