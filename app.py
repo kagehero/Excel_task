@@ -1708,13 +1708,22 @@ def get_exchange_rate_from_record_list(
         # 列のインデックスから-1（前の列）と-2（さらに前の列）を取得
         all_cols = df.columns.tolist()
         
+        # 操作種類ごとのキーワード（record-list上の表記揺れに対応）
+        if operation_type == '商品購入':
+            op_keywords = ['商品購入', '購入', '商品代金', '商品金額']
+        elif operation_type == '国際配送':
+            op_keywords = ['国際配送', '国際運賃', '国際送料', '国際配送料']
+        else:
+            # 予備的にoperation_typeそのもののみを見る
+            op_keywords = [operation_type]
+        
         # -1列（前の列）を確認
         if target_col_idx > 0:
             prev_col = all_cols[target_col_idx - 1]
             prev_value = str(row[prev_col]).strip() if pd.notna(row[prev_col]) else ''
             
-            # 操作種類が一致するか確認
-            if operation_type in prev_value:
+            # 操作種類が一致するか確認（キーワードのいずれかを含めばOK）
+            if any(kw in prev_value for kw in op_keywords):
                 # -2列（さらに前の列）からレートを取得
                 if target_col_idx > 1:
                     rate_col = all_cols[target_col_idx - 2]
@@ -3042,12 +3051,17 @@ def process_data_from_previews(
         # 中国国内送料（円・1個あたり）をresultに保存（表示用）
         result['中国国内送料（円・1個あたり）'] = domestic_shipping_per_item
         
+        # 商品1個あたりの割引額（円）を取得（なければ0）
+        discount_per_item_jpy = result.get('商品1個につき割引額（円）', 0) or 0
+        
+        # 原価の計算（値引きを控除）
         result['原価(円)'] = (
             unit_price_jpy +
             domestic_shipping_per_item +
             result.get('商品1個あたり国際送料（円）', 0) +
             result.get('商品1個あたりのオプション費用（円）', 0) +
-            result.get('商品1個あたり関税（円）', 0)
+            result.get('商品1個あたり関税（円）', 0) -
+            discount_per_item_jpy
         )
         
         # サイズ区分と配送代行手数料を計算
@@ -3528,10 +3542,15 @@ def main():
                     styled_fba = instruction_df.style.apply(highlight_fba_option_cost, axis=None)
                     format_dict = {}
                     for col in instruction_df.columns:
-                        if 'オプション' in col or '費用' in col:
+                        # 元金額：小数点第2位まで
+                        if '元' in col or 'オプション' in col or '費用' in col:
                             format_dict[col] = '{:,.2f}'
-                        elif col == '数量':
-                            format_dict[col] = '{:,.0f}'
+                        # 数量：小数点第1位まで
+                        elif col == '数量' or '数量' in col:
+                            format_dict[col] = '{:,.1f}'
+                        # 寸法・体積：小数点第1位まで
+                        elif 'cm' in col or '寸法' in col or '体積' in col:
+                            format_dict[col] = '{:,.1f}'
                     styled_fba = styled_fba.format(format_dict, na_rep='-')
                     
                     st.dataframe(styled_fba, width='stretch', height=250)
@@ -3552,6 +3571,40 @@ def main():
                     with col3:
                         if instruction_order_count > 0:
                             st.metric("指示書の注文番号数（H列）", f"{instruction_order_count}件")
+                    
+                    # 値引きデータを表示（シート2から取得）
+                    discount_df = get_discount_from_instruction_sheet2(st.session_state.uploaded_files['fba'])
+                    if not discount_df.empty:
+                        st.markdown("---")
+                        st.subheader("🔻 値引き情報（シート2）")
+                        st.caption("FBA指示書のシート2から取得した値引きデータ")
+                        
+                        # 値引きテーブルをスタイル付きで表示
+                        def highlight_discount(df):
+                            import pandas as pd
+                            styles = pd.DataFrame('', index=df.index, columns=df.columns)
+                            if '割引額（元）' in df.columns:
+                                styles['割引額（元）'] = 'background-color: #FFF4E6; border-left: 3px solid #F59E0B; font-weight: 500;'
+                            return styles
+                        
+                        styled_discount = discount_df.style.apply(highlight_discount, axis=None)
+                        format_dict = {}
+                        if '割引額（元）' in discount_df.columns:
+                            format_dict['割引額（元）'] = '{:,.2f}'
+                        styled_discount = styled_discount.format(format_dict, na_rep='-')
+                        
+                        st.dataframe(styled_discount, width='stretch', height=200)
+                        
+                        # 値引き合計を表示
+                        total_discount = discount_df['割引額（元）'].sum() if '割引額（元）' in discount_df.columns else 0
+                        discount_count = len(discount_df)
+                        col_d1, col_d2 = st.columns(2)
+                        with col_d1:
+                            st.metric("値引き件数", f"{discount_count}件")
+                        with col_d2:
+                            st.metric("値引き合計", f"{total_discount:,.2f}元")
+                    else:
+                        st.info("💡 値引きデータ（シート2）が見つかりませんでした。")
                     
                     # 突合チェック結果を表示（後でsend_orderと比較）
                     # ここでは一時的にプレースホルダーを表示
@@ -5314,10 +5367,16 @@ def main():
             # 数値フォーマット
             format_dict = {}
             for col in display_df.columns:
-                if '円' in col or '元' in col or '原価' in col:
+                # 元金額：小数点第2位まで
+                if '元' in col:
                     format_dict[col] = '{:,.2f}'
-                elif col == '数量':
-                    format_dict[col] = '{:,.0f}'
+                # 円金額：小数点第2位まで
+                elif '円' in col or '原価' in col:
+                    format_dict[col] = '{:,.2f}'
+                # 数量：小数点第1位まで
+                elif col == '数量' or '数量' in col:
+                    format_dict[col] = '{:,.1f}'
+                # 寸法・体積：小数点第1位まで
                 elif 'cm' in col or '寸法' in col or '体積' in col:
                     format_dict[col] = '{:,.1f}'
             
@@ -5367,6 +5426,7 @@ def main():
                     domestic_shipping_cny = selected_row.get('中国国内送料（元）', 0) or 0
                     qty = selected_row.get('数量', 1) or 1
                     option_fee_jpy = selected_row.get('商品1個あたりのオプション費用（円）', 0) or 0
+                    discount_jpy = selected_row.get('商品1個につき割引額（円）', 0) or 0
                     international_shipping_jpy = selected_row.get('商品1個あたり国際送料（円）', 0) or 0
                     customs_jpy = selected_row.get('商品1個あたり関税（円）', 0) or 0
                     actual_cost = selected_row.get('原価(円)', 0) or 0
@@ -5397,6 +5457,26 @@ def main():
                         total_asins_for_tax = results_df['ASIN'].nunique()
                     except Exception:
                         total_asins_for_tax = None
+                    
+                    # 配送代行手数料表から手数料を取得（表示用）
+                    fee_over_1000 = ''
+                    fee_under_1000 = ''
+                    if 'shipping_fee_table' in st.session_state and hasattr(st.session_state, 'shipping_fee_table'):
+                        shipping_fee_table = st.session_state.shipping_fee_table
+                        if not shipping_fee_table.empty and size_category:
+                            fee_row = shipping_fee_table[shipping_fee_table['サイズ区分'] == size_category]
+                            if not fee_row.empty:
+                                fee_over_1000_val = fee_row.iloc[0].get('価格>1000円', '')
+                                fee_under_1000_val = fee_row.iloc[0].get('価格≤1000円', '')
+                                # 数値の場合はフォーマット
+                                if isinstance(fee_over_1000_val, (int, float)):
+                                    fee_over_1000 = f"{fee_over_1000_val:,.0f}"
+                                else:
+                                    fee_over_1000 = str(fee_over_1000_val) if fee_over_1000_val else ''
+                                if isinstance(fee_under_1000_val, (int, float)):
+                                    fee_under_1000 = f"{fee_under_1000_val:,.0f}"
+                                else:
+                                    fee_under_1000 = str(fee_under_1000_val) if fee_under_1000_val else ''
                     
                     # 為替レートを取得（表示用の参考値として）
                     cny_to_jpy_rate = st.session_state.get('cny_to_jpy_rate', 22.77)
@@ -5469,6 +5549,13 @@ def main():
                                 else "総額 ÷ ASIN数 ÷ 数量"
                             ),
                             "icon": "📋"
+                        },
+                        {
+                            "title": "⑥値引き",
+                            "value_cny": -discount_jpy / cny_to_jpy_rate if cny_to_jpy_rate > 0 else 0,
+                            "value_jpy": -discount_jpy,
+                            "formula": f"-{discount_jpy:,.2f}円 / 個",
+                            "icon": "🔻"
                         }
                     ]
                     
@@ -5537,22 +5624,8 @@ def main():
                                 <div style="font-size: 12px; color: #2E5266; line-height: 1.8;">
                                     サイズ区分: {size_category or '-'}<br>
                                     商品単価（1個あたり・円）: {unit_price_jpy:,.2f} 円<br>
-                                    価格 &gt; 1000円 の手数料: {{
-                                        st.session_state.shipping_fee_table[st.session_state.shipping_fee_table['サイズ区分'] == size_category]['価格>1000円'].iloc[0]
-                                        if 'shipping_fee_table' in st.session_state 
-                                           and hasattr(st.session_state, 'shipping_fee_table') 
-                                           and not st.session_state.shipping_fee_table.empty 
-                                           and size_category in st.session_state.shipping_fee_table['サイズ区分'].values
-                                        else ''
-                                    }} 円<br>
-                                    価格 ≤ 1000円 の手数料: {{
-                                        st.session_state.shipping_fee_table[st.session_state.shipping_fee_table['サイズ区分'] == size_category]['価格≤1000円'].iloc[0]
-                                        if 'shipping_fee_table' in st.session_state 
-                                           and hasattr(st.session_state, 'shipping_fee_table') 
-                                           and not st.session_state.shipping_fee_table.empty 
-                                           and size_category in st.session_state.shipping_fee_table['サイズ区分'].values
-                                        else ''
-                                    }} 円<br>
+                                    価格 &gt; 1000円 の手数料: {fee_over_1000 or '-'} 円<br>
+                                    価格 ≤ 1000円 の手数料: {fee_under_1000 or '-'} 円<br>
                                     = <strong>適用された配送代行手数料: {shipping_agent_fee:,.2f} 円</strong>
                                 </div>
                             </div>
@@ -5574,7 +5647,8 @@ def main():
                         domestic_shipping_per_item_jpy +
                         option_fee_jpy +
                         international_shipping_jpy +
-                        customs_jpy
+                        customs_jpy -
+                        discount_jpy
                     )
                     
                     # 最終結果を表示
@@ -5589,7 +5663,8 @@ def main():
                                 + ¥{domestic_shipping_per_item_jpy:,.2f}<br>
                                 + ¥{option_fee_jpy:,.2f}<br>
                                 + ¥{international_shipping_jpy:,.2f}<br>
-                                + ¥{customs_jpy:,.2f}
+                            + ¥{customs_jpy:,.2f}<br>
+                            - ¥{discount_jpy:,.2f}
                             </div>
                         </div>
                         """, unsafe_allow_html=True)
@@ -5620,6 +5695,38 @@ def main():
             output = BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 display_df.to_excel(writer, index=False, sheet_name='処理結果')
+                
+                # Excel出力時の数値フォーマットを設定
+                worksheet = writer.sheets['処理結果']
+                
+                # 列ごとにフォーマットを適用
+                for col_idx, col_name in enumerate(display_df.columns, start=1):
+                    col_letter = worksheet.cell(row=1, column=col_idx).column_letter
+                    
+                    # 元金額：小数点第2位まで
+                    if '元' in col_name:
+                        for row_idx in range(2, len(display_df) + 2):
+                            cell = worksheet.cell(row=row_idx, column=col_idx)
+                            if isinstance(cell.value, (int, float)):
+                                cell.number_format = '#,##0.00'
+                    # 円金額：小数点第2位まで
+                    elif '円' in col_name or '原価' in col_name:
+                        for row_idx in range(2, len(display_df) + 2):
+                            cell = worksheet.cell(row=row_idx, column=col_idx)
+                            if isinstance(cell.value, (int, float)):
+                                cell.number_format = '#,##0.00'
+                    # 数量：小数点第1位まで
+                    elif col_name == '数量' or '数量' in col_name:
+                        for row_idx in range(2, len(display_df) + 2):
+                            cell = worksheet.cell(row=row_idx, column=col_idx)
+                            if isinstance(cell.value, (int, float)):
+                                cell.number_format = '#,##0.0'
+                    # 寸法・体積：小数点第1位まで
+                    elif 'cm' in col_name or '寸法' in col_name or '体積' in col_name:
+                        for row_idx in range(2, len(display_df) + 2):
+                            cell = worksheet.cell(row=row_idx, column=col_idx)
+                            if isinstance(cell.value, (int, float)):
+                                cell.number_format = '#,##0.0'
             
             st.download_button(
                 label="📥 Excelファイルをダウンロード",
