@@ -2490,48 +2490,56 @@ def display_file_info(file_info_dict):
 def get_size_category(length: float, width: float, height: float) -> str:
     """
     サイズ区分を判定
-    配送代行手数料表の条件に基づいて判定
+    ユーザー指定のルールに基づいて判定
+    
+    - 小型: 25×18×2cm以下（3辺を大きい順に並べて L<=25, M<=18, S<=2）
+    - 標準1: 35×30×3.3cm以下（L<=35, M<=30, S<=3.3）
+    - 標準2a〜標準4: 3辺合計で判定
+      * 標準2a: 合計20cm以下
+      * 標準2b: 合計30cm以下
+      * 標準2c: 合計40cm以下
+      * 標準2d: 合計50cm以下
+      * 標準2e: 合計60cm以下
+      * 標準3: 合計80cm以下
+      * 標準4: 合計100cm以下
     """
+    try:
+        length = float(length)
+        width = float(width)
+        height = float(height)
+    except (TypeError, ValueError):
+        return "不明"
+    
     if length <= 0 or width <= 0 or height <= 0:
         return "不明"
     
-    max_dimension = max(length, width, height)
-    sum_dimensions = length + width + height
+    # 大きい順に並べる
+    dims = sorted([length, width, height], reverse=True)
+    L, M, S = dims
+    total = L + M + S
     
     # 小型: 25×18×2cm以下
-    if max_dimension <= 25 and sum_dimensions <= 45:  # 25+18+2=45
+    if L <= 25 and M <= 18 and S <= 2:
         return "小型"
     
     # 標準1: 35×30×3.3cm以下
-    if max_dimension <= 35 and sum_dimensions <= 68.3:  # 35+30+3.3=68.3
+    if L <= 35 and M <= 30 and S <= 3.3:
         return "標準1"
     
-    # 標準2a: 20cm以下
-    if max_dimension <= 20:
+    # 標準2a〜標準4: 3辺合計で判定
+    if total <= 20:
         return "標準2a"
-    
-    # 標準2b: 30cm以下
-    if max_dimension <= 30:
+    if total <= 30:
         return "標準2b"
-    
-    # 標準2c: 40cm以下
-    if max_dimension <= 40:
+    if total <= 40:
         return "標準2c"
-    
-    # 標準2d: 50cm以下
-    if max_dimension <= 50:
+    if total <= 50:
         return "標準2d"
-    
-    # 標準2e: 60cm以下
-    if max_dimension <= 60:
+    if total <= 60:
         return "標準2e"
-    
-    # 標準3: 80cm以下
-    if max_dimension <= 80:
+    if total <= 80:
         return "標準3"
-    
-    # 標準4: 100cm以下
-    if max_dimension <= 100:
+    if total <= 100:
         return "標準4"
     
     # それ以上は大型
@@ -2898,6 +2906,8 @@ def process_data_from_previews(
             option_rate = cny_to_jpy_rate
         base_option_fee_jpy = base_option_fee_cny * option_rate
         base_option_fee_per_item_jpy = base_option_fee_jpy / qty if qty > 0 else 0
+        # 指示書由来のオプション費用（1個あたり・円）を保存（内訳表示用）
+        result['基本オプション費用（1個あたり・円）'] = base_option_fee_per_item_jpy
         print(f"基本オプション費用（1個あたり・円）: {base_option_fee_per_item_jpy}")
         
         # 2. メールのオプション料金で検算（合計値と比較）と差額の計算
@@ -2979,6 +2989,8 @@ def process_data_from_previews(
         
         # 合計オプション費用 = 指示書の基本オプション費用 + 差額による追加オプション費用
         total_option_fee_per_item_jpy = base_option_fee_per_item_jpy + additional_option_fee_jpy
+        # 追加配分分（1個あたり・円）を保存（内訳表示用）
+        result['追加オプション費用（1個あたり・円）'] = additional_option_fee_jpy
         result['商品1個あたりのオプション費用（円）'] = total_option_fee_per_item_jpy
         result['商品1個あたりのオプション費用（元）'] = total_option_fee_per_item_jpy / option_rate if option_rate > 0 else 0
         print(f"合計オプション費用（1個あたり・円）: {total_option_fee_per_item_jpy}")
@@ -2989,6 +3001,9 @@ def process_data_from_previews(
             total_consumption = tax_data.get('消費税', 0) or 0
             total_local = tax_data.get('地方消費税', 0) or 0
             
+            # 関税総額を保存（内訳表示用）
+            result['関税（総額・円）'] = total_customs
+            
             # ASINの数で割って、さらにそのASINの数量で割る
             total_asins = len(fba_df)
             if total_asins > 0 and qty > 0:
@@ -2996,6 +3011,9 @@ def process_data_from_previews(
                 customs_per_asin = total_customs / total_asins
                 consumption_per_asin = total_consumption / total_asins
                 local_per_asin = total_local / total_asins
+                
+                # 関税（ASINあたり・円）を保存（内訳表示用）
+                result['関税（ASINあたり・円）'] = customs_per_asin
                 
                 # 商品1個あたりの税金
                 result['商品1個あたり関税（円）'] = customs_per_asin / qty
@@ -4479,53 +4497,65 @@ def main():
                                                                 existing_asins = [d.get('asin', '') for d in existing_distributions if d.get('asin')]
                                                                 existing_asins_str = ', '.join(existing_asins)
                                                             
-                                                            # ASINをカンマ区切りで入力
-                                                            asin_input = st.text_input(
-                                                                f"{item_name}のASIN（カンマ区切り）",
-                                                                value=existing_asins_str,
-                                                                key=f"asin_input_{item_name}_{shipping_request_no}",
-                                                                help="例: B0BKFS9N54, B0G1LDVHGV, B0G1LL31KR"
+                                                            # 全ASINに一括分配するかどうか
+                                                            apply_all_asins = st.checkbox(
+                                                                f"{item_name} を全ASINに均等分配する",
+                                                                key=f"apply_all_asins_{item_name}_{shipping_request_no}",
+                                                                help="チェックすると、指示書に含まれるすべてのASINに同額を分配します。"
                                                             )
                                                             
-                                                            # ASINをパース
-                                                            if asin_input:
-                                                                asin_list = [asin.strip() for asin in asin_input.split(',') if asin.strip()]
-                                                                
-                                                                if asin_list:
-                                                                    # 各ASINに均等に分配
-                                                                    amount_per_asin = item_value / len(asin_list)
-                                                                    
-                                                                    st.info(f"💡 {len(asin_list)}個のASINに均等分配: 各 {amount_per_asin:,.2f} 元")
-                                                                    
-                                                                    # 分配情報を作成
-                                                                    distributions_for_item = []
-                                                                    for asin in asin_list:
-                                                                        distributions_for_item.append({
-                                                                            'item_name': item_name,
-                                                                            'asin': asin,
-                                                                            'amount': amount_per_asin
-                                                                        })
-                                                                    
-                                                                    # 分配情報を更新
-                                                                    # 既存のこの項目の分配を削除
-                                                                    st.session_state.option_cost_manual_distribution[distribution_key] = [
-                                                                        d for d in st.session_state.option_cost_manual_distribution[distribution_key]
-                                                                        if d.get('item_name') != item_name
-                                                                    ]
-                                                                    # 新しい分配を追加
-                                                                    st.session_state.option_cost_manual_distribution[distribution_key].extend(distributions_for_item)
-                                                                    
-                                                                    # 分配結果を表示
-                                                                    import pandas as pd
-                                                                    distribution_preview = pd.DataFrame([
-                                                                        {'ASIN': dist['asin'], '金額(元)': f"{dist['amount']:,.2f}"}
-                                                                        for dist in distributions_for_item
-                                                                    ])
-                                                                    st.dataframe(distribution_preview, width='stretch', hide_index=True)
-                                                                else:
-                                                                    st.warning("⚠️ ASINが入力されていません")
+                                                            asin_list = []
+                                                            
+                                                            if apply_all_asins:
+                                                                # 指示書に含まれる全ASINを対象に分配
+                                                                asin_list = available_asins
+                                                                st.info(f"💡 全ASIN ({len(asin_list)}件) に均等分配します。ASINの個別入力は不要です。")
                                                             else:
-                                                                # ASINが入力されていない場合、既存の分配を削除
+                                                                # ASINをカンマ区切りで入力
+                                                                asin_input = st.text_input(
+                                                                    f"{item_name}のASIN（カンマ区切り）",
+                                                                    value=existing_asins_str,
+                                                                    key=f"asin_input_{item_name}_{shipping_request_no}",
+                                                                    help="例: B0BKFS9N54, B0G1LDVHGV, B0G1LL31KR"
+                                                                )
+                                                                
+                                                                # ASINをパース
+                                                                if asin_input:
+                                                                    asin_list = [asin.strip() for asin in asin_input.split(',') if asin.strip()]
+                                                                
+                                                            if asin_list:
+                                                                # 各ASINに均等に分配（ASINごとに同額）
+                                                                amount_per_asin = item_value / len(asin_list)
+                                                                
+                                                                st.info(f"💡 {len(asin_list)}個のASINに均等分配: 各 {amount_per_asin:,.2f} 元")
+                                                                
+                                                                # 分配情報を作成
+                                                                distributions_for_item = []
+                                                                for asin in asin_list:
+                                                                    distributions_for_item.append({
+                                                                        'item_name': item_name,
+                                                                        'asin': asin,
+                                                                        'amount': amount_per_asin
+                                                                    })
+                                                                
+                                                                # 分配情報を更新
+                                                                # 既存のこの項目の分配を削除
+                                                                st.session_state.option_cost_manual_distribution[distribution_key] = [
+                                                                    d for d in st.session_state.option_cost_manual_distribution[distribution_key]
+                                                                    if d.get('item_name') != item_name
+                                                                ]
+                                                                # 新しい分配を追加
+                                                                st.session_state.option_cost_manual_distribution[distribution_key].extend(distributions_for_item)
+                                                                
+                                                                # 分配結果を表示
+                                                                import pandas as pd
+                                                                distribution_preview = pd.DataFrame([
+                                                                    {'ASIN': dist['asin'], '金額(元)': f"{dist['amount']:,.2f}"}
+                                                                    for dist in distributions_for_item
+                                                                ])
+                                                                st.dataframe(distribution_preview, width='stretch', hide_index=True)
+                                                            else:
+                                                                # ASINが指定されていない場合、既存のこの項目の分配を削除
                                                                 st.session_state.option_cost_manual_distribution[distribution_key] = [
                                                                     d for d in st.session_state.option_cost_manual_distribution[distribution_key]
                                                                     if d.get('item_name') != item_name
@@ -5340,6 +5370,8 @@ def main():
                     international_shipping_jpy = selected_row.get('商品1個あたり国際送料（円）', 0) or 0
                     customs_jpy = selected_row.get('商品1個あたり関税（円）', 0) or 0
                     actual_cost = selected_row.get('原価(円)', 0) or 0
+                    size_category = selected_row.get('サイズ区分', '')
+                    shipping_agent_fee = selected_row.get('配送代行手数料（円）', 0) or 0
                     
                     # 実際に計算された値を使用（異なる為替レートが適用されているため）
                     unit_price_jpy = selected_row.get('購入単価（円）', 0) or 0
@@ -5352,6 +5384,19 @@ def main():
                     volume = selected_row.get('体積(cm3)', 0) or 0
                     total_volume = selected_row.get('総体積(cm3)', 0) or 0
                     allocation_ratio = selected_row.get('按分比率', 0) or 0
+                    
+                    # オプション費用内訳（指示書由来＋追加配分）を取得
+                    base_option_fee_per_item_jpy = selected_row.get('基本オプション費用（1個あたり・円）', 0) or 0
+                    additional_option_fee_per_item_jpy = selected_row.get('追加オプション費用（1個あたり・円）', 0) or 0
+                    
+                    # 関税内訳（総額・ASINあたり）を取得
+                    customs_total_jpy = selected_row.get('関税（総額・円）', 0) or 0
+                    customs_per_asin_jpy = selected_row.get('関税（ASINあたり・円）', 0) or 0
+                    # 税按分に使ったASIN数（表示用）- DataFrame全体から推定
+                    try:
+                        total_asins_for_tax = results_df['ASIN'].nunique()
+                    except Exception:
+                        total_asins_for_tax = None
                     
                     # 為替レートを取得（表示用の参考値として）
                     cny_to_jpy_rate = st.session_state.get('cny_to_jpy_rate', 22.77)
@@ -5395,7 +5440,7 @@ def main():
                             "title": "③オプション費用",
                             "value_cny": option_fee_jpy / cny_to_jpy_rate if cny_to_jpy_rate > 0 else 0,
                             "value_jpy": option_fee_jpy,
-                            "formula": "指示書 + 追加配分",
+                            "formula": f"指示書: {base_option_fee_per_item_jpy:,.2f}円/個 + 追加配分: {additional_option_fee_per_item_jpy:,.2f}円/個 = 合計: {option_fee_jpy:,.2f}円/個",
                             "icon": "⚙️"
                         },
                         {
@@ -5418,7 +5463,11 @@ def main():
                             "title": "⑤関税",
                             "value_cny": customs_jpy / cny_to_jpy_rate if cny_to_jpy_rate > 0 else 0,
                             "value_jpy": customs_jpy,
-                            "formula": "総額 ÷ ASIN数 ÷ 数量",
+                            "formula": (
+                                f"総額: {customs_total_jpy:,.2f}円 ÷ ASIN数: {total_asins_for_tax or '-'} ÷ 数量: {qty:,.0f}個 = {customs_jpy:,.2f}円/個"
+                                if customs_total_jpy > 0 and (total_asins_for_tax or 0) > 0 and qty > 0
+                                else "総額 ÷ ASIN数 ÷ 数量"
+                            ),
                             "icon": "📋"
                         }
                     ]
@@ -5452,19 +5501,59 @@ def main():
                                 </div>
                             </div>
                             <div style="background-color: #FFF; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
-                                <div style="font-size: 11px; color: #6B7280; margin-bottom: 10px;"><strong>ステップ2: 体積比率を計算</strong></div>
-                                <div style="font-size: 12px; color: #2E5266; line-height: 1.8;">
+                                <div style="font-size: 11px; color: {{"#6B7280"}}; margin-bottom: 10px;"><strong>ステップ2: 体積比率を計算</strong></div>
+                                <div style="font-size: 12px; color: {{"#2E5266"}}; line-height: 1.8;">
                                     この商品の体積（1個あたり）: {volume:,.0f} cm³<br>
                                     ÷ 総体積（全商品合計）: {total_volume:,.0f} cm³<br>
                                     = <strong>按分比率: {allocation_ratio:.4f} ({allocation_ratio*100:.2f}%)</strong>
                                 </div>
                             </div>
                             <div style="background-color: #FFF; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
-                                <div style="font-size: 11px; color: #6B7280; margin-bottom: 10px;"><strong>ステップ3: 商品1個あたりの国際送料を計算</strong></div>
-                                <div style="font-size: 12px; color: #2E5266; line-height: 1.8;">
+                                <div style="font-size: 11px; color: {{"#6B7280"}}; margin-bottom: 10px;"><strong>ステップ3: 商品1個あたりの国際送料を計算</strong></div>
+                                <div style="font-size: 12px; color: {{"#2E5266"}}; line-height: 1.8;">
                                     国際送料（円・総額）: {international_shipping_jpy_total:,.2f} 円<br>
                                     × 按分比率: {allocation_ratio:.4f}<br>
                                     = <strong>商品1個あたり国際送料（円）: {international_shipping_jpy:,.2f} 円</strong>
+                                </div>
+                            </div>
+                            <div style="background-color: #FFF; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                                <div style="font-size: 11px; color: #6B7280; margin-bottom: 10px;"><strong>ステップ4: オプション費用の内訳</strong></div>
+                                <div style="font-size: 12px; color: #2E5266; line-height: 1.8;">
+                                    指示書由来（1個あたり）: {base_option_fee_per_item_jpy:,.2f} 円<br>
+                                    追加配分（1個あたり）: {additional_option_fee_per_item_jpy:,.2f} 円<br>
+                                    = <strong>合計（1個あたり）: {option_fee_jpy:,.2f} 円</strong>
+                                </div>
+                            </div>
+                            <div style="background-color: #FFF; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                                <div style="font-size: 11px; color: #6B7280; margin-bottom: 10px;"><strong>ステップ5: 関税の計算</strong></div>
+                                <div style="font-size: 12px; color: #2E5266; line-height: 1.8;">
+                                    関税総額: {customs_total_jpy:,.2f} 円<br>
+                                    1ASINあたり関税: {customs_per_asin_jpy:,.2f} 円<br>
+                                    = <strong>商品1個あたり関税: {customs_jpy:,.2f} 円</strong>
+                                </div>
+                            </div>
+                            <div style="background-color: #FFF; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                                <div style="font-size: 11px; color: #6B7280; margin-bottom: 10px;"><strong>ステップ6: 配送代行手数料の計算</strong></div>
+                                <div style="font-size: 12px; color: #2E5266; line-height: 1.8;">
+                                    サイズ区分: {size_category or '-'}<br>
+                                    商品単価（1個あたり・円）: {unit_price_jpy:,.2f} 円<br>
+                                    価格 &gt; 1000円 の手数料: {{
+                                        st.session_state.shipping_fee_table[st.session_state.shipping_fee_table['サイズ区分'] == size_category]['価格>1000円'].iloc[0]
+                                        if 'shipping_fee_table' in st.session_state 
+                                           and hasattr(st.session_state, 'shipping_fee_table') 
+                                           and not st.session_state.shipping_fee_table.empty 
+                                           and size_category in st.session_state.shipping_fee_table['サイズ区分'].values
+                                        else ''
+                                    }} 円<br>
+                                    価格 ≤ 1000円 の手数料: {{
+                                        st.session_state.shipping_fee_table[st.session_state.shipping_fee_table['サイズ区分'] == size_category]['価格≤1000円'].iloc[0]
+                                        if 'shipping_fee_table' in st.session_state 
+                                           and hasattr(st.session_state, 'shipping_fee_table') 
+                                           and not st.session_state.shipping_fee_table.empty 
+                                           and size_category in st.session_state.shipping_fee_table['サイズ区分'].values
+                                        else ''
+                                    }} 円<br>
+                                    = <strong>適用された配送代行手数料: {shipping_agent_fee:,.2f} 円</strong>
                                 </div>
                             </div>
                             <div style="background-color: #E0F2FE; padding: 15px; border-radius: 8px; border-left: 4px solid #0EA5E9;">
