@@ -4141,7 +4141,7 @@ def main():
                             if 'send_order' in st.session_state.uploaded_files and not record_df.empty:
                                 st.markdown("---")
                                 st.subheader("💰 商品金額（元）の突合チェック")
-                                st.caption("send_orderとrecord_listで注文番号に従う商品1個に対する商品金額（元）を比較")
+                                st.caption("record_listの金額（CNY）と、send_orderの単価（元）×数量（send_order数量）を比較")
                                 
                                 # send_orderの全データを取得（ASINごとに集約される前のデータ）
                                 send_order_file_path = st.session_state.uploaded_files['send_order']
@@ -4171,7 +4171,7 @@ def main():
                                                 # 負の値の場合は絶対値を取る（-9.50 → 9.50）
                                                 record_amount_cny = abs(float(record_amount_cny_raw)) if record_amount_cny_raw else 0
                                                 
-                                                # record_listから数量（num）を取得
+                                                # record_listから数量（num）を取得（あれば表示用に保持）
                                                 record_num = record_row.get('数量（num）', None)
                                                 if record_num is not None:
                                                     try:
@@ -4180,7 +4180,7 @@ def main():
                                                         record_num = None
                                                 else:
                                                     record_num = None
-                                                
+
                                                 # send_orderから該当する注文番号を検索
                                                 # 注文番号がカンマ区切りの場合も考慮
                                                 send_order_matches = send_order_df_full[
@@ -4195,32 +4195,21 @@ def main():
                                                         order_nos_in_cell = [o.strip() for o in str(send_order_no).split(',') if o.strip()]
                                                         
                                                         if order_no in order_nos_in_cell or send_order_no == order_no:
-                                                            send_price = send_row.get(price_col_so, 0) or 0
-                                                            send_qty = send_row.get(qty_col_so, 0) or 0
-                                                            
-                                                            # send_orderの1個あたりの金額を計算
-                                                            # send_orderの単価は通常1個あたりの金額なので、そのまま使用
-                                                            # ただし、単価が注文全体の金額である可能性もあるため、数量で割る処理も試す
-                                                            # まずは単価をそのまま使用（1個あたりと仮定）
-                                                            send_price_per_item = send_price
-                                                            
-                                                            # record_listの金額を1個あたりに変換
-                                                            # record_listの金額が注文全体の可能性があるため、send_orderの数量で割る
-                                                            # ただし、record_listの金額が既に1個あたりの可能性もあるため、両方のパターンを試す
-                                                            record_price_per_item_total = record_amount_cny / send_qty if send_qty > 0 else record_amount_cny
-                                                            record_price_per_item_direct = record_amount_cny
-                                                            
-                                                            # どちらのパターンが近いかで判定（差が小さい方を採用）
-                                                            diff_total = abs(send_price_per_item - record_price_per_item_total)
-                                                            diff_direct = abs(send_price_per_item - record_price_per_item_direct)
-                                                            
-                                                            if diff_direct < diff_total:
-                                                                record_price_per_item = record_price_per_item_direct
-                                                            else:
-                                                                record_price_per_item = record_price_per_item_total
-                                                            
-                                                            # 差額を計算
-                                                            difference = abs(send_price_per_item - record_price_per_item)
+                                                            # send_order側の金額（元・合計）を計算
+                                                            # 単価（元）× 数量（send_order数量）
+                                                            try:
+                                                                send_price = float(send_row.get(price_col_so, 0) or 0)
+                                                            except (ValueError, TypeError):
+                                                                send_price = 0.0
+                                                            try:
+                                                                send_qty = float(send_row.get(qty_col_so, 0) or 0)
+                                                            except (ValueError, TypeError):
+                                                                send_qty = 0.0
+
+                                                            send_total_cny = send_price * send_qty
+
+                                                            # 差額を計算（合計金額ベース）
+                                                            difference = abs(send_total_cny - record_amount_cny)
                                                             tolerance = 0.01
                                                             
                                                             asin = send_row.get(asin_col_so, '') if asin_col_so else ''
@@ -4232,8 +4221,8 @@ def main():
                                                                 'お客様管理番号': customer_no,
                                                                 'send_order数量': send_qty,
                                                                 'record_list数量': record_num if record_num is not None else '',
-                                                                'send_order金額（元/個）': send_price_per_item,
-                                                                'record_list金額（元/個）': record_price_per_item,
+                                                                'send_order金額（元・合計）': send_total_cny,
+                                                                'record_list金額（元・合計）': record_amount_cny,
                                                                 '差額（元）': difference,
                                                                 '一致': difference <= tolerance
                                                             })
@@ -4252,12 +4241,12 @@ def main():
                                                 
                                                 # 一致した場合も商品数を表示（オプション）
                                                 if st.checkbox("一致したデータも表示", key="show_matched_data"):
-                                                    display_cols_matched = ['注文番号', 'ASIN', 'お客様管理番号', 'send_order数量', 'record_list数量', 'send_order金額（元/個）', 'record_list金額（元/個）']
+                                                    display_cols_matched = ['注文番号', 'ASIN', 'お客様管理番号', 'send_order数量', 'record_list数量', 'send_order金額（元・合計）', 'record_list金額（元・合計）']
                                                     display_cols_matched = [col for col in display_cols_matched if col in matched.columns]
                                                     matched_display = matched[display_cols_matched].copy()
                                                     
                                                     # 数値列をフォーマット
-                                                    for col in ['send_order金額（元/個）', 'record_list金額（元/個）']:
+                                                    for col in ['send_order金額（元・合計）', 'record_list金額（元・合計）']:
                                                         if col in matched_display.columns:
                                                             matched_display[col] = matched_display[col].apply(lambda x: f"{x:,.2f}" if pd.notna(x) and x != '' else '')
                                                     
@@ -4272,13 +4261,13 @@ def main():
                                                 st.warning(f"⚠️ **不一致**: {len(mismatched)}件の注文番号で金額が一致しません")
                                                 
                                                 # 不一致の詳細を表示
-                                                display_cols = ['注文番号', 'ASIN', 'お客様管理番号', 'send_order数量', 'record_list数量', 'send_order金額（元/個）', 'record_list金額（元/個）', '差額（元）']
+                                                display_cols = ['注文番号', 'ASIN', 'お客様管理番号', 'send_order数量', 'record_list数量', 'send_order金額（元・合計）', 'record_list金額（元・合計）', '差額（元）']
                                                 # 存在する列のみを表示
                                                 display_cols = [col for col in display_cols if col in mismatched.columns]
                                                 mismatched_display = mismatched[display_cols].copy()
                                                 
                                                 # 数値列をフォーマット
-                                                for col in ['send_order金額（元/個）', 'record_list金額（元/個）', '差額（元）']:
+                                                for col in ['send_order金額（元・合計）', 'record_list金額（元・合計）', '差額（元）']:
                                                     if col in mismatched_display.columns:
                                                         mismatched_display[col] = mismatched_display[col].apply(lambda x: f"{x:,.2f}" if pd.notna(x) and x != '' else '')
                                                 
